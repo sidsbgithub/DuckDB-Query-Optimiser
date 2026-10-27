@@ -1,0 +1,87 @@
+# name: test/sql/recycling_limit.test
+# description: a LIMIT above capture does not publish a partial result
+# group: [sql]
+
+require waddle
+
+# These tests observe pipeline breakers; whole query results are tested in recycling_query_result.test.
+statement ok
+SET GLOBAL waddle_recycling_query_results = false;
+
+statement ok
+SET threads = 1;
+
+statement ok
+CREATE TABLE recycling_limit_values AS SELECT i % 3 AS key FROM range(12) t(i);
+
+query I
+SELECT sum(n) FROM (
+    SELECT key, count(*) AS n FROM recycling_limit_values GROUP BY key LIMIT 1
+);
+----
+4
+
+query IIII
+SELECT lookups, hits, misses, captures FROM waddle_recycling_stats();
+----
+1	0	1	1
+
+query II rowsort
+SELECT key, count(*) FROM recycling_limit_values GROUP BY key;
+----
+0	4
+1	4
+2	4
+
+query IIII
+SELECT lookups, hits, misses, captures FROM waddle_recycling_stats();
+----
+2	1	1	1
+
+# A LIMIT above an aggregate over a join: the aggregate and the build side inside it are both captured
+# completely, whatever the LIMIT cuts off above them. The outer query reads every output of the aggregate, so the
+# optimizer prunes none and the recycling key matches the query without the LIMIT.
+statement ok
+CREATE TABLE recycling_limit_dimension AS SELECT i AS key FROM range(3) t(i);
+
+statement ok
+CALL enable_logging('WaddleRecycling');
+
+statement ok
+SET waddle_recycling_diagnostics = true;
+
+query II
+SELECT count(*), sum(n) FROM (
+    SELECT l.key, count(*) AS n FROM recycling_limit_values l JOIN recycling_limit_dimension d ON l.key = d.key
+    GROUP BY l.key LIMIT 1
+);
+----
+1	4
+
+# Without the LIMIT, the aggregate replays all of its groups.
+query II rowsort
+SELECT l.key, count(*) AS n FROM recycling_limit_values l JOIN recycling_limit_dimension d ON l.key = d.key
+GROUP BY l.key;
+----
+0	4
+1	4
+2	4
+
+# A different aggregate over the same join replays the whole build side.
+query II rowsort
+SELECT l.key, sum(l.key) FROM recycling_limit_values l JOIN recycling_limit_dimension d ON l.key = d.key
+GROUP BY l.key;
+----
+0	0
+1	4
+2	8
+
+query I
+SELECT regexp_extract(message, '^([a-z]+) breaker=([a-z_]+) ', ['event', 'breaker'])::VARCHAR
+FROM duckdb_logs WHERE type = 'WaddleRecycling' AND message NOT LIKE 'skip %';
+----
+{'event': miss, 'breaker': aggregate}
+{'event': miss, 'breaker': join_build_side}
+{'event': hit, 'breaker': aggregate}
+{'event': miss, 'breaker': aggregate}
+{'event': hit, 'breaker': join_build_side}

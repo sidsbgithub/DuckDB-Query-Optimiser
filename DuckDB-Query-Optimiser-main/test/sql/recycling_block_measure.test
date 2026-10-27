@@ -1,0 +1,118 @@
+# name: test/sql/recycling_block_measure.test
+# description: a block is captured only once its counted rows fit the per-result cap, so a block too large to keep is never copied
+# group: [sql]
+
+require waddle
+
+statement ok
+SET threads = 4;
+
+statement ok
+SET preserve_insertion_order = false;
+
+statement ok
+CREATE TABLE bm_movie AS SELECT i AS id, 1990 + i % 30 AS year, i % 4 AS kind FROM range(800) t(i);
+
+statement ok
+CREATE TABLE bm_credit AS SELECT i AS id, (i * 13) % 800 AS movie_id, i % 3 AS role, i % 11 AS nr FROM range(200000) t(i);
+
+# The expected answers, without recycling.
+statement ok
+SET waddle_recycling = false;
+
+query II rowsort by_role
+SELECT c.role, count(*) FROM bm_credit c JOIN bm_movie m ON m.id = c.movie_id WHERE m.year BETWEEN 2000 AND 2005 GROUP BY c.role;
+----
+
+query II rowsort by_kind
+SELECT m.kind, count(*) FROM bm_credit c JOIN bm_movie m ON m.id = c.movie_id WHERE m.year BETWEEN 2000 AND 2005 GROUP BY m.kind;
+----
+
+query II rowsort by_nr
+SELECT c.nr, count(*) FROM bm_credit c JOIN bm_movie m ON m.id = c.movie_id WHERE m.year BETWEEN 2000 AND 2005 GROUP BY c.nr;
+----
+
+query II rowsort by_year
+SELECT m.year, count(*) FROM bm_credit c JOIN bm_movie m ON m.id = c.movie_id WHERE m.year BETWEEN 2000 AND 2005 GROUP BY m.year;
+----
+
+query II rowsort early_by_role
+SELECT c.role, count(*) FROM bm_credit c JOIN bm_movie m ON m.id = c.movie_id WHERE m.year BETWEEN 1991 AND 1996 GROUP BY c.role;
+----
+
+query II rowsort early_by_nr
+SELECT c.nr, count(*) FROM bm_credit c JOIN bm_movie m ON m.id = c.movie_id WHERE m.year BETWEEN 1991 AND 1996 GROUP BY c.nr;
+----
+
+statement ok
+SET waddle_recycling = true;
+
+# The block's 40000 rows take far more than a quarter of this budget; a one-row aggregate result fits.
+statement ok
+SET waddle_recycling_max_bytes = 1100000;
+
+# A family's first statement is not captured; it counts the block's rows.
+query II rowsort by_role
+SELECT c.role, count(*) FROM bm_credit c JOIN bm_movie m ON m.id = c.movie_id WHERE m.year BETWEEN 2000 AND 2005 GROUP BY c.role;
+----
+
+# The repeat would capture the block, but its count says it does not fit: it is not copied, so no capture is
+# aborted.
+query II rowsort by_kind
+SELECT m.kind, count(*) FROM bm_credit c JOIN bm_movie m ON m.id = c.movie_id WHERE m.year BETWEEN 2000 AND 2005 GROUP BY m.kind;
+----
+
+query I
+SELECT aborted_captures FROM waddle_recycling_stats();
+----
+0
+
+# Under a larger budget the count says the block fits: the next statement captures it, and the one after replays
+# it.
+statement ok
+SET waddle_recycling_max_bytes = 100000000;
+
+query II rowsort by_nr
+SELECT c.nr, count(*) FROM bm_credit c JOIN bm_movie m ON m.id = c.movie_id WHERE m.year BETWEEN 2000 AND 2005 GROUP BY c.nr;
+----
+
+statement ok
+SET VARIABLE hits_before = (SELECT hits FROM waddle_recycling_stats());
+
+query II rowsort by_year
+SELECT m.year, count(*) FROM bm_credit c JOIN bm_movie m ON m.id = c.movie_id WHERE m.year BETWEEN 2000 AND 2005 GROUP BY m.year;
+----
+
+query II
+SELECT hits - getvariable('hits_before'), aborted_captures FROM waddle_recycling_stats();
+----
+1	0
+
+# A LIMIT ends a statement before every row of its block is counted, so that count is not kept. The block's
+# 40000 rows exceed this per-result cap; the rows counted before the LIMIT ended the statement would not.
+statement ok
+SET waddle_recycling_max_bytes = 3200000;
+
+statement ok
+SET VARIABLE aborted_before = (SELECT aborted_captures FROM waddle_recycling_stats());
+
+query I
+SELECT count(*) FROM (SELECT c.role FROM bm_credit c JOIN bm_movie m ON m.id = c.movie_id WHERE m.year BETWEEN 1991 AND 1996 LIMIT 5);
+----
+5
+
+# The repeat would capture the block, but its size is not known, and its counted sibling (the 2000-2005 block) is too
+# large to vouch for it: it counts the rows instead. The next statement then knows the block does not fit, so no
+# capture is copied and aborted.
+query II rowsort early_by_role
+SELECT c.role, count(*) FROM bm_credit c JOIN bm_movie m ON m.id = c.movie_id WHERE m.year BETWEEN 1991 AND 1996 GROUP BY c.role;
+----
+
+query II rowsort early_by_nr
+SELECT c.nr, count(*) FROM bm_credit c JOIN bm_movie m ON m.id = c.movie_id WHERE m.year BETWEEN 1991 AND 1996 GROUP BY c.nr;
+----
+
+query I
+SELECT aborted_captures - getvariable('aborted_before') FROM waddle_recycling_stats();
+----
+0

@@ -1,0 +1,74 @@
+# name: test/sql/recycling_join_build.test
+# description: hash joins replay a repeated filtered build side while preserving join answers
+# group: [sql]
+
+require waddle
+
+# These tests observe pipeline breakers; whole query results are tested in recycling_query_result.test.
+statement ok
+SET GLOBAL waddle_recycling_query_results = false;
+
+statement ok
+CALL enable_logging('WaddleRecycling');
+
+statement ok
+SET waddle_recycling_diagnostics = true;
+
+statement ok
+CREATE TABLE recycling_build_fact AS SELECT i AS id FROM range(1, 5) t(i);
+
+statement ok
+CREATE TABLE recycling_build_dimension(id INTEGER, active BOOLEAN, label VARCHAR);
+
+statement ok
+INSERT INTO recycling_build_dimension VALUES (1, true, 'one'), (2, false, 'two'), (3, true, 'three');
+
+query II rowsort
+SELECT f.id, d.label FROM recycling_build_fact f
+LEFT JOIN (SELECT id, label FROM recycling_build_dimension WHERE active) d ON f.id = d.id;
+----
+1	one
+2	NULL
+3	three
+4	NULL
+
+query IIII
+SELECT lookups, hits, misses, captures FROM waddle_recycling_stats();
+----
+1	0	1	1
+
+# A different condition still replays the same build side, with the join evaluated afresh.
+query II rowsort
+SELECT f.id, d.label FROM recycling_build_fact f
+LEFT JOIN (SELECT id, label FROM recycling_build_dimension WHERE active) d ON f.id + 1 = d.id;
+----
+1	NULL
+2	three
+3	NULL
+4	NULL
+
+query IIII
+SELECT lookups, hits, misses, captures FROM waddle_recycling_stats();
+----
+2	1	1	1
+
+# A different join kind also uses the build side but returns its own vanilla answer.
+query II rowsort
+SELECT f.id, d.label FROM recycling_build_fact f
+JOIN (SELECT id, label FROM recycling_build_dimension WHERE active) d ON f.id = d.id;
+----
+1	one
+3	three
+
+query IIII
+SELECT lookups, hits, misses, captures FROM waddle_recycling_stats();
+----
+3	2	1	1
+
+# Diagnostics identify the replayed pipeline breaker as the join build side.
+query I
+SELECT regexp_extract(message, 'breaker=([a-z_]+) ', 1)
+FROM duckdb_logs WHERE type = 'WaddleRecycling' AND message LIKE 'hit breaker=%';
+----
+join_build_side
+join_build_side

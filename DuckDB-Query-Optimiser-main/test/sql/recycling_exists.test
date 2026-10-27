@@ -1,0 +1,117 @@
+# name: test/sql/recycling_exists.test
+# description: equality EXISTS decorrelation preserves duplicates, nulls and anti joins
+# group: [sql]
+
+require waddle
+
+statement ok
+SET threads = 4;
+
+statement ok
+CREATE TABLE ex_outer AS SELECT * FROM (VALUES (1, 10), (1, 10), (2, 20), (3, NULL), (NULL, 10), (4, 40)) t(id, grp);
+
+statement ok
+CREATE TABLE ex_inner AS SELECT * FROM (VALUES (1, 10, 1), (1, 10, 1), (2, 20, 0), (3, NULL, 1), (NULL, 10, 1), (4, 41, 1)) t(id, grp, enabled);
+
+query II rowsort
+SELECT o.id, o.grp FROM ex_outer o WHERE EXISTS (SELECT 1 FROM ex_inner i WHERE i.id = o.id AND i.enabled = 1);
+----
+1	10
+1	10
+3	NULL
+4	40
+
+# The existence relation is now closed and eligible for breaker recycling.
+query I
+SELECT skipped_delim_get = 0 AND lookups > 0 FROM waddle_recycling_stats();
+----
+true
+
+query II rowsort
+SELECT o.id, o.grp FROM ex_outer o WHERE NOT EXISTS (SELECT 1 FROM ex_inner i WHERE i.id = o.id AND i.enabled = 1);
+----
+2	20
+NULL	10
+
+query II rowsort
+SELECT o.id, o.grp FROM ex_outer o WHERE EXISTS (SELECT 1 FROM ex_inner i WHERE i.id IS NOT DISTINCT FROM o.id AND i.enabled = 1);
+----
+1	10
+1	10
+3	NULL
+4	40
+NULL	10
+
+query II rowsort
+SELECT o.id, o.grp FROM ex_outer o WHERE EXISTS (SELECT 1 FROM ex_inner i WHERE i.id = o.id AND i.grp = o.grp AND i.enabled = 1);
+----
+1	10
+1	10
+
+query II rowsort
+SELECT o.id, o.grp FROM ex_outer o WHERE NOT EXISTS (SELECT 1 FROM ex_inner i WHERE i.id IS NOT DISTINCT FROM o.id AND i.grp IS NOT DISTINCT FROM o.grp AND i.enabled = 1);
+----
+2	20
+4	40
+
+# Grouping/count, LIMIT, inequalities and projected markers keep their own semantics.
+query II rowsort
+SELECT o.id, o.grp FROM ex_outer o WHERE EXISTS (SELECT count(*) FROM ex_inner i WHERE i.id = o.id AND i.enabled = 1);
+----
+1	10
+1	10
+2	20
+3	NULL
+4	40
+NULL	10
+
+query II rowsort
+SELECT o.id, o.grp FROM ex_outer o WHERE EXISTS (SELECT 1 FROM ex_inner i WHERE i.id = o.id AND i.enabled = 1 LIMIT 1 OFFSET 1);
+----
+1	10
+1	10
+
+query II rowsort
+SELECT o.id, o.grp FROM ex_outer o WHERE EXISTS (SELECT 1 FROM ex_inner i WHERE i.id > o.id AND i.enabled = 1);
+----
+1	10
+1	10
+2	20
+3	NULL
+
+query II rowsort
+SELECT o.id, EXISTS (SELECT 1 FROM ex_inner i WHERE i.id = o.id AND i.enabled = 1) FROM ex_outer o;
+----
+1	true
+1	true
+2	false
+3	true
+4	true
+NULL	false
+
+# Nested EXISTS and sibling correlations cannot capture a result dependent on a removed delimiter.
+query I rowsort
+SELECT o.id FROM ex_outer o WHERE EXISTS (
+    SELECT 1 FROM ex_inner i WHERE i.id = o.id AND EXISTS (
+        SELECT 1 FROM ex_outer x WHERE x.grp IS NOT DISTINCT FROM i.grp AND x.id = i.id
+    )
+);
+----
+1
+1
+2
+3
+
+# Verification replans and checks the rewritten query against DuckDB's unoptimized execution.
+statement ok
+PRAGMA enable_verification;
+
+query II rowsort
+SELECT o.id, o.grp FROM ex_outer o WHERE EXISTS (SELECT 1 FROM ex_inner i WHERE i.id = o.id AND i.grp IS NOT DISTINCT FROM o.grp AND i.enabled = 1);
+----
+1	10
+1	10
+3	NULL
+
+statement ok
+EXPLAIN ANALYZE SELECT o.id FROM ex_outer o WHERE NOT EXISTS (SELECT 1 FROM ex_inner i WHERE i.id = o.id AND i.enabled = 1);

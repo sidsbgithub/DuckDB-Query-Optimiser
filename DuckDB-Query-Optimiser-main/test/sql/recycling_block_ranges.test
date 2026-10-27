@@ -1,0 +1,177 @@
+# name: test/sql/recycling_block_ranges.test
+# description: a block result also holds the rows of a block that differs only by narrower ranges on its columns
+# group: [sql]
+
+require waddle
+
+statement ok
+SET threads = 4;
+
+statement ok
+SET preserve_insertion_order = false;
+
+# Every tenth movie has no year, and every seventh no release date.
+statement ok
+CREATE TABLE br_movie AS SELECT i AS id, CASE WHEN i % 10 = 0 THEN NULL ELSE 1990 + i % 30 END AS year, CASE WHEN i % 7 = 0 THEN NULL ELSE DATE '2000-01-01' + INTERVAL (i) DAY END AS released, i % 4 AS kind FROM range(900) t(i);
+
+statement ok
+CREATE TABLE br_credit AS SELECT i AS id, (i * 13) % 900 AS movie_id, i % 3 AS role, (i * 7) % 500 AS person_id FROM range(30000) t(i);
+
+# Persons 400-499 do not exist: the LEFT JOIN keeps their credits with a NULL age.
+statement ok
+CREATE TABLE br_person AS SELECT i AS id, 20 + i % 60 AS age FROM range(400) t(i);
+
+statement ok
+SET waddle_recycling = false;
+
+query II rowsort wide
+SELECT c.role, count(*) FROM br_credit c JOIN br_movie m ON m.id = c.movie_id WHERE m.year BETWEEN 2000 AND 2010 AND m.kind < 3 GROUP BY c.role;
+----
+
+query II rowsort wide_by_year
+SELECT m.year, count(DISTINCT c.person_id) FROM br_credit c JOIN br_movie m ON m.id = c.movie_id WHERE m.year BETWEEN 2000 AND 2010 AND m.kind < 3 GROUP BY m.year;
+----
+
+query II rowsort narrow
+SELECT m.year, count(*) FROM br_credit c JOIN br_movie m ON m.id = c.movie_id WHERE m.year BETWEEN 2003 AND 2004 AND m.kind < 3 GROUP BY m.year;
+----
+
+query II rowsort one_year
+SELECT c.role, count(*) FROM br_credit c JOIN br_movie m ON m.id = c.movie_id WHERE m.year = 2010 AND m.kind < 3 GROUP BY c.role;
+----
+
+query II rowsort open_bounds
+SELECT c.role, count(*) FROM br_credit c JOIN br_movie m ON m.id = c.movie_id WHERE m.year > 2000 AND 2010 > m.year AND m.kind < 3 GROUP BY c.role;
+----
+
+query II rowsort outside
+SELECT c.role, count(*) FROM br_credit c JOIN br_movie m ON m.id = c.movie_id WHERE m.year BETWEEN 1999 AND 2004 AND m.kind < 3 GROUP BY c.role;
+----
+
+query II rowsort unbounded
+SELECT c.role, count(*) FROM br_credit c JOIN br_movie m ON m.id = c.movie_id WHERE m.kind < 3 GROUP BY c.role;
+----
+
+query II rowsort not_null
+SELECT c.role, count(*) FROM br_credit c JOIN br_movie m ON m.id = c.movie_id WHERE m.year IS NOT NULL AND m.kind < 3 GROUP BY c.role;
+----
+
+query II rowsort within_not_null
+SELECT m.year, count(*) FROM br_credit c JOIN br_movie m ON m.id = c.movie_id WHERE m.year >= 2015 AND m.kind < 3 GROUP BY m.year;
+----
+
+query II rowsort dates
+SELECT c.role, count(*) FROM br_credit c JOIN br_movie m ON m.id = c.movie_id WHERE m.released BETWEEN DATE '2000-03-01' AND DATE '2001-06-30' GROUP BY c.role;
+----
+
+query II rowsort dates_again
+SELECT c.role, count(DISTINCT c.person_id) FROM br_credit c JOIN br_movie m ON m.id = c.movie_id WHERE m.released BETWEEN DATE '2000-03-01' AND DATE '2001-06-30' GROUP BY c.role;
+----
+
+query II rowsort dates_within
+SELECT c.role, count(*) FROM br_credit c JOIN br_movie m ON m.id = c.movie_id WHERE m.released > DATE '2000-06-01' AND m.released <= DATE '2000-12-31' GROUP BY c.role;
+----
+
+query II rowsort outer_ages
+SELECT c.role, count(*) FROM br_credit c LEFT JOIN br_person p ON p.id = c.person_id WHERE p.age BETWEEN 30 AND 60 GROUP BY c.role;
+----
+
+query II rowsort outer_ages_again
+SELECT p.age, count(*) FROM br_credit c LEFT JOIN br_person p ON p.id = c.person_id WHERE p.age BETWEEN 30 AND 60 GROUP BY p.age;
+----
+
+query II rowsort outer_ages_within
+SELECT c.role, count(*) FROM br_credit c LEFT JOIN br_person p ON p.id = c.person_id WHERE p.age >= 40 AND p.age < 45 GROUP BY c.role;
+----
+
+statement ok
+SET waddle_recycling = true;
+
+# The second statement of the family captures the wider block.
+query II rowsort wide
+SELECT c.role, count(*) FROM br_credit c JOIN br_movie m ON m.id = c.movie_id WHERE m.year BETWEEN 2000 AND 2010 AND m.kind < 3 GROUP BY c.role;
+----
+
+query II rowsort wide_by_year
+SELECT m.year, count(DISTINCT c.person_id) FROM br_credit c JOIN br_movie m ON m.id = c.movie_id WHERE m.year BETWEEN 2000 AND 2010 AND m.kind < 3 GROUP BY m.year;
+----
+
+statement ok
+SET VARIABLE hits_before = (SELECT hits FROM waddle_recycling_stats());
+
+# Narrower ranges replay the wider block and filter its rows.
+query II rowsort narrow
+SELECT m.year, count(*) FROM br_credit c JOIN br_movie m ON m.id = c.movie_id WHERE m.year BETWEEN 2003 AND 2004 AND m.kind < 3 GROUP BY m.year;
+----
+
+query I
+SELECT hits - getvariable('hits_before') FROM waddle_recycling_stats();
+----
+1
+
+query II rowsort one_year
+SELECT c.role, count(*) FROM br_credit c JOIN br_movie m ON m.id = c.movie_id WHERE m.year = 2010 AND m.kind < 3 GROUP BY c.role;
+----
+
+query II rowsort open_bounds
+SELECT c.role, count(*) FROM br_credit c JOIN br_movie m ON m.id = c.movie_id WHERE m.year > 2000 AND 2010 > m.year AND m.kind < 3 GROUP BY c.role;
+----
+
+# Ranges that reach outside the block's are computed.
+statement ok
+SET VARIABLE hits_before = (SELECT hits FROM waddle_recycling_stats());
+
+query II rowsort outside
+SELECT c.role, count(*) FROM br_credit c JOIN br_movie m ON m.id = c.movie_id WHERE m.year BETWEEN 1999 AND 2004 AND m.kind < 3 GROUP BY c.role;
+----
+
+query II rowsort unbounded
+SELECT c.role, count(*) FROM br_credit c JOIN br_movie m ON m.id = c.movie_id WHERE m.kind < 3 GROUP BY c.role;
+----
+
+query I
+SELECT hits - getvariable('hits_before') FROM waddle_recycling_stats();
+----
+0
+
+# IS NOT NULL is the widest range: it holds every block with a range on the column.
+query II rowsort not_null
+SELECT c.role, count(*) FROM br_credit c JOIN br_movie m ON m.id = c.movie_id WHERE m.year IS NOT NULL AND m.kind < 3 GROUP BY c.role;
+----
+
+query II rowsort within_not_null
+SELECT m.year, count(*) FROM br_credit c JOIN br_movie m ON m.id = c.movie_id WHERE m.year >= 2015 AND m.kind < 3 GROUP BY m.year;
+----
+
+query II rowsort dates
+SELECT c.role, count(*) FROM br_credit c JOIN br_movie m ON m.id = c.movie_id WHERE m.released BETWEEN DATE '2000-03-01' AND DATE '2001-06-30' GROUP BY c.role;
+----
+
+query II rowsort dates_again
+SELECT c.role, count(DISTINCT c.person_id) FROM br_credit c JOIN br_movie m ON m.id = c.movie_id WHERE m.released BETWEEN DATE '2000-03-01' AND DATE '2001-06-30' GROUP BY c.role;
+----
+
+query II rowsort dates_within
+SELECT c.role, count(*) FROM br_credit c JOIN br_movie m ON m.id = c.movie_id WHERE m.released > DATE '2000-06-01' AND m.released <= DATE '2000-12-31' GROUP BY c.role;
+----
+
+# A WHERE range on an outer join's right side also drops the rows the join padded with NULLs.
+query II rowsort outer_ages
+SELECT c.role, count(*) FROM br_credit c LEFT JOIN br_person p ON p.id = c.person_id WHERE p.age BETWEEN 30 AND 60 GROUP BY c.role;
+----
+
+query II rowsort outer_ages_again
+SELECT p.age, count(*) FROM br_credit c LEFT JOIN br_person p ON p.id = c.person_id WHERE p.age BETWEEN 30 AND 60 GROUP BY p.age;
+----
+
+statement ok
+SET VARIABLE hits_before = (SELECT hits FROM waddle_recycling_stats());
+
+query II rowsort outer_ages_within
+SELECT c.role, count(*) FROM br_credit c LEFT JOIN br_person p ON p.id = c.person_id WHERE p.age >= 40 AND p.age < 45 GROUP BY c.role;
+----
+
+query I
+SELECT hits - getvariable('hits_before') FROM waddle_recycling_stats();
+----
+1

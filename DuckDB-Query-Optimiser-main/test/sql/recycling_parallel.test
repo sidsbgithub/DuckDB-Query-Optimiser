@@ -1,0 +1,36 @@
+# name: test/sql/recycling_parallel.test
+# description: replay scans a multi-chunk aggregate under a parent aggregate
+# group: [sql]
+
+require waddle
+
+# These tests observe pipeline breakers; whole query results are tested in recycling_query_result.test.
+statement ok
+SET GLOBAL waddle_recycling_query_results = false;
+
+statement ok
+SET threads = 6;
+
+statement ok
+CREATE TABLE recycling_parallel_values AS SELECT i % 5000 AS key FROM range(100000) t(i);
+
+query I
+SELECT sum(n) FROM (SELECT key, count(*) AS n FROM recycling_parallel_values GROUP BY key);
+----
+100000
+
+query I
+SELECT sum(n) FROM (SELECT key, count(*) AS n FROM recycling_parallel_values GROUP BY key);
+----
+100000
+
+# A different parent misses, so the inner aggregate is what replays.
+query I
+SELECT max(n) FROM (SELECT key, count(*) AS n FROM recycling_parallel_values GROUP BY key);
+----
+20
+
+query IIII
+SELECT lookups, hits, misses, captures FROM waddle_recycling_stats();
+----
+5	2	3	3

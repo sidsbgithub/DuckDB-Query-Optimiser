@@ -1,0 +1,113 @@
+# name: test/sql/recycling_cte.test
+# description: shared CTE definitions are captured and replayed across different outer queries
+# group: [sql]
+
+require waddle
+
+# These tests observe pipeline breakers; whole query results are tested in recycling_query_result.test.
+statement ok
+SET GLOBAL waddle_recycling_query_results = false;
+
+statement ok
+CREATE TABLE recycling_cte_values AS SELECT i AS value FROM range(1, 5) t(i);
+
+query I rowsort
+WITH shared AS MATERIALIZED (SELECT value FROM recycling_cte_values WHERE value >= 2)
+SELECT value FROM shared;
+----
+2
+3
+4
+
+query I rowsort
+WITH shared AS MATERIALIZED (SELECT value FROM recycling_cte_values WHERE value >= 2)
+SELECT value * 2 FROM shared;
+----
+4
+6
+8
+
+query IIII
+SELECT lookups, hits, misses, captures FROM waddle_recycling_stats();
+----
+2	1	1	1
+
+# The CTE name does not identify its result; changing the definition must miss.
+query I rowsort
+WITH shared AS MATERIALIZED (SELECT value FROM recycling_cte_values WHERE value >= 3)
+SELECT value FROM shared;
+----
+3
+4
+
+query IIII
+SELECT lookups, hits, misses, captures FROM waddle_recycling_stats();
+----
+3	1	2	2
+
+# A replayed definition still feeds every reference in the outer query.
+query II rowsort
+WITH shared AS MATERIALIZED (SELECT value FROM recycling_cte_values WHERE value >= 2)
+SELECT a.value, b.value FROM shared a JOIN shared b ON a.value = b.value;
+----
+2	2
+3	3
+4	4
+
+query IIII
+SELECT lookups, hits, misses, captures FROM waddle_recycling_stats();
+----
+4	2	2	2
+
+# If the definition is ineligible, an aggregate over its reference cannot be recycled either. (The earlier
+# self-join's build side read a reference too, and counted the first CTE-reference skip.)
+query I
+WITH shared AS MATERIALIZED (SELECT value FROM recycling_cte_values ORDER BY value)
+SELECT count(*) FROM shared;
+----
+4
+
+query III
+SELECT lookups, hits, skipped_cte_reference FROM waddle_recycling_stats();
+----
+4	2	2
+
+# Each branch's CTE definition is looked up: separate branches are separate recyclable subtrees.
+query I rowsort
+SELECT value FROM (
+    WITH first AS MATERIALIZED (SELECT value FROM recycling_cte_values WHERE value = 2)
+    SELECT value FROM first
+)
+UNION ALL
+SELECT value FROM (
+    WITH second AS MATERIALIZED (SELECT value FROM recycling_cte_values WHERE value = 3)
+    SELECT value FROM second
+);
+----
+2
+3
+
+query IIII
+SELECT lookups, hits, misses, captures FROM waddle_recycling_stats();
+----
+6	2	4	4
+
+# The repeat replays both definitions in one statement; each keeps its own bindings.
+query I rowsort
+SELECT value FROM (
+    WITH first AS MATERIALIZED (SELECT value FROM recycling_cte_values WHERE value = 2)
+    SELECT value FROM first
+)
+UNION ALL
+SELECT value FROM (
+    WITH second AS MATERIALIZED (SELECT value FROM recycling_cte_values WHERE value = 3)
+    SELECT value FROM second
+);
+----
+2
+3
+
+query IIII
+SELECT lookups, hits, misses, captures FROM waddle_recycling_stats();
+----
+8	4	4	4

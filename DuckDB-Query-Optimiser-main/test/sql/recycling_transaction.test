@@ -1,0 +1,43 @@
+# name: test/sql/recycling_transaction.test
+# description: explicit transactions bypass database-wide recycled results
+# group: [sql]
+
+require waddle
+
+# These tests observe pipeline breakers; whole query results are tested in recycling_query_result.test.
+statement ok
+SET GLOBAL waddle_recycling_query_results = false;
+
+statement ok
+CREATE TABLE recycling_transaction_values AS SELECT i AS value FROM range(12) t(i);
+
+statement ok
+BEGIN TRANSACTION;
+
+query I
+SELECT sum(value) FROM recycling_transaction_values;
+----
+66
+
+query I
+SELECT sum(value) FROM recycling_transaction_values;
+----
+66
+
+query IIII
+SELECT lookups, hits, misses, captures FROM waddle_recycling_stats();
+----
+0	0	0	0
+
+statement ok
+COMMIT;
+
+query I
+SELECT sum(value) FROM recycling_transaction_values;
+----
+66
+
+query IIII
+SELECT lookups, hits, misses, captures FROM waddle_recycling_stats();
+----
+1	0	1	1

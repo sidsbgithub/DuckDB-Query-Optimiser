@@ -1,0 +1,106 @@
+# name: test/sql/recycling_unused_join.test
+# description: unused outer joins disappear only when all grouping keys prove uniqueness
+# group: [sql]
+
+require waddle
+
+statement ok
+CREATE TABLE uj_left AS SELECT * FROM (VALUES (1, 'one'), (2, 'two'), (3, 'three'), (NULL, 'null')) t(id, label);
+
+statement ok
+CREATE TABLE uj_right AS SELECT * FROM (VALUES (1, 10), (1, 20), (2, 10), (NULL, 10)) t(id, category);
+
+# Filtering the grouped input does not invalidate its uniqueness. Unmatched left rows survive.
+query T rowsort
+SELECT l.label FROM uj_left l LEFT JOIN (SELECT id, count(*) n FROM uj_right WHERE category > 10 GROUP BY id) r ON l.id = r.id;
+----
+null
+one
+three
+two
+
+# No hash-join build side or grouped right side was captured.
+query I
+SELECT lookups FROM waddle_recycling_stats();
+----
+0
+
+# A subset of grouping keys is not unique: id 1 must be duplicated.
+query T rowsort
+SELECT l.label FROM uj_left l LEFT JOIN (SELECT id, category, count(*) n FROM uj_right GROUP BY id, category) r ON l.id = r.id;
+----
+null
+one
+one
+three
+two
+
+# All keys, including null-safe equality, do prove uniqueness.
+query T rowsort
+SELECT l.label FROM uj_left l LEFT JOIN (SELECT id, category, count(*) n FROM uj_right GROUP BY id, category) r ON l.id IS NOT DISTINCT FROM r.id AND r.category = 10;
+----
+null
+one
+three
+two
+
+# A right column referenced by an ancestor filter or projection must survive.
+query TI rowsort
+SELECT l.label, r.n FROM uj_left l LEFT JOIN (SELECT id, count(*) n FROM uj_right GROUP BY id) r ON l.id = r.id WHERE r.n > 1;
+----
+one	2
+
+query TI rowsort
+SELECT l.label, r.n FROM uj_left l LEFT JOIN (SELECT id, count(*) n FROM uj_right GROUP BY id) r ON l.id IS NOT DISTINCT FROM r.id;
+----
+null	1
+one	2
+three	NULL
+two	1
+
+# Grouping sets can duplicate a key.
+query T rowsort
+SELECT l.label FROM uj_left l LEFT JOIN (SELECT id, count(*) n FROM uj_right GROUP BY GROUPING SETS ((id), (id))) r ON l.id = r.id;
+----
+null
+one
+one
+three
+two
+two
+
+# Duplicate-producing ordinary right inputs cannot be removed.
+query T rowsort
+SELECT l.label FROM uj_left l LEFT JOIN uj_right r ON l.id = r.id;
+----
+null
+one
+one
+three
+two
+
+# EXPLAIN ANALYZE takes the same optimization path.
+statement ok
+EXPLAIN ANALYZE SELECT l.label FROM uj_left l LEFT JOIN (SELECT id FROM uj_right GROUP BY id) r ON l.id = r.id;
+
+# Do not suppress an error from the discarded side of a join.
+statement ok
+CREATE TABLE uj_bad AS SELECT 'not an integer' AS id;
+
+statement error
+SELECT l.label FROM uj_left l LEFT JOIN (SELECT CAST(id AS INTEGER) AS id FROM uj_bad WHERE CAST(id AS INTEGER) > 0 GROUP BY 1) r ON l.id = r.id;
+----
+Conversion Error
+
+# DuckDB removes an aggregate that nothing reads without evaluating it: a discarded side that only aggregates a
+# throwing expression raises no error.
+statement ok
+CREATE TABLE uj_info AS SELECT * FROM (VALUES (1, '1.5'), (2, 'oops'), (2, '3')) t(id, info);
+
+query T rowsort
+SELECT l.label FROM uj_left l LEFT JOIN (SELECT id, min(CAST(info AS DOUBLE)) AS v FROM uj_info GROUP BY id) r ON l.id = r.id;
+----
+null
+one
+three
+two

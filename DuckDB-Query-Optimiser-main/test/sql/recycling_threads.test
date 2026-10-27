@@ -1,0 +1,88 @@
+# name: test/sql/recycling_threads.test
+# description: recycling answers are identical with 1 and 6 threads
+# group: [sql]
+
+require waddle
+
+# These tests observe pipeline breakers; whole query results are tested in recycling_query_result.test.
+statement ok
+SET GLOBAL waddle_recycling_query_results = false;
+
+# 50000 groups over 300000 rows: many chunks, so 6 threads each sink part of the capture and combine.
+statement ok
+CREATE TABLE recycling_threads_values AS
+SELECT i % 50000 AS key, i AS value, CASE WHEN i % 7 = 0 THEN NULL ELSE i % 11 END AS maybe
+FROM range(300000) t(i);
+
+# Vanilla answers, recorded under a label; each later query with the same label must return the same rows.
+statement ok
+SET waddle_recycling = false;
+
+statement ok
+SET threads = 6;
+
+query IIII rowsort six_then_one
+SELECT key, count(*), sum(value), count(maybe) FROM recycling_threads_values GROUP BY key;
+----
+
+query III rowsort one_then_six
+SELECT maybe, count(*), sum(value) FROM recycling_threads_values GROUP BY maybe;
+----
+
+statement ok
+SET waddle_recycling = true;
+
+# Captured with 6 threads, replayed with 1.
+query IIII rowsort six_then_one
+SELECT key, count(*), sum(value), count(maybe) FROM recycling_threads_values GROUP BY key;
+----
+
+statement ok
+SET threads = 1;
+
+query IIII rowsort six_then_one
+SELECT key, count(*), sum(value), count(maybe) FROM recycling_threads_values GROUP BY key;
+----
+
+query IIII
+SELECT lookups, hits, misses, captures FROM waddle_recycling_stats();
+----
+2	1	1	1
+
+# Captured with 1 thread, replayed with 6.
+query III rowsort one_then_six
+SELECT maybe, count(*), sum(value) FROM recycling_threads_values GROUP BY maybe;
+----
+
+statement ok
+SET threads = 6;
+
+query III rowsort one_then_six
+SELECT maybe, count(*), sum(value) FROM recycling_threads_values GROUP BY maybe;
+----
+
+query IIII
+SELECT lookups, hits, misses, captures FROM waddle_recycling_stats();
+----
+4	2	2	2
+
+# Under a parent aggregate: captured with 6 threads, replayed with 1. The parent reads fewer outputs, so the
+# optimizer prunes the others and this is a new recycling key. The second parent differs, so it misses and the
+# inner aggregate is what replays.
+query II
+SELECT count(*), sum(total) FROM (SELECT key, count(*), sum(value) AS total, count(maybe) FROM recycling_threads_values GROUP BY key);
+----
+50000	44999850000
+
+statement ok
+SET threads = 1;
+
+query II
+SELECT sum(total), count(*) FROM (SELECT key, count(*), sum(value) AS total, count(maybe) FROM recycling_threads_values GROUP BY key);
+----
+44999850000	50000
+
+query IIII
+SELECT lookups, hits, misses, captures FROM waddle_recycling_stats();
+----
+8	3	5	5

@@ -1,0 +1,227 @@
+# name: test/sql/recycling_invalidation.test
+# description: committing a write or schema change discards every recycled result; SET, PRAGMA, reads and rollbacks do not
+# group: [sql]
+
+require waddle
+
+# These tests observe pipeline breakers; whole query results are tested in recycling_query_result.test.
+statement ok
+SET GLOBAL waddle_recycling_query_results = false;
+
+# Creating the table is itself a schema change.
+statement ok
+CREATE TABLE recycling_invalidation_values AS SELECT i AS value FROM range(10) t(i);
+
+query I
+SELECT sum(value) FROM recycling_invalidation_values;
+----
+45
+
+query I
+SELECT sum(value) FROM recycling_invalidation_values;
+----
+45
+
+query IIIII
+SELECT hits, misses, captures, invalidations, current_bytes > 0 FROM waddle_recycling_stats();
+----
+1	1	1	1	true
+
+# INSERT: the next run misses and sees the new row.
+statement ok
+INSERT INTO recycling_invalidation_values VALUES (100);
+
+query II
+SELECT invalidations, current_bytes FROM waddle_recycling_stats();
+----
+2	0
+
+query I
+SELECT sum(value) FROM recycling_invalidation_values;
+----
+145
+
+query III
+SELECT hits, misses, invalidations FROM waddle_recycling_stats();
+----
+1	2	2
+
+# A write in an explicit transaction invalidates when it commits. Until then it is in flight: another
+# connection cannot see the uncommitted write, and neither replays nor captures meanwhile.
+statement ok con1
+BEGIN TRANSACTION;
+
+statement ok con1
+UPDATE recycling_invalidation_values SET value = value + 1;
+
+query I con2
+SELECT sum(value) FROM recycling_invalidation_values;
+----
+145
+
+query I con2
+SELECT sum(value) FROM recycling_invalidation_values;
+----
+145
+
+statement ok con1
+COMMIT;
+
+query I con2
+SELECT sum(value) FROM recycling_invalidation_values;
+----
+156
+
+# Setup statements and reads leave recycled results in place: the next run hits.
+statement ok
+SET threads = 2;
+
+statement ok
+PRAGMA enable_profiling = 'no_output';
+
+statement ok
+PRAGMA disable_profiling;
+
+statement ok
+PRAGMA table_info('recycling_invalidation_values');
+
+statement ok
+SELECT value FROM recycling_invalidation_values WHERE value > 5;
+
+query I
+SELECT sum(value) FROM recycling_invalidation_values;
+----
+156
+
+query II
+SELECT hits, invalidations FROM waddle_recycling_stats();
+----
+2	3
+
+# A rolled-back write changed nothing: the recycled result stays and still holds the answer.
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+DELETE FROM recycling_invalidation_values;
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT sum(value) FROM recycling_invalidation_values;
+----
+156
+
+query II
+SELECT hits, invalidations FROM waddle_recycling_stats();
+----
+3	3
+
+# So does a write that fails.
+statement error
+INSERT INTO recycling_invalidation_values VALUES ('not a number');
+----
+
+query II
+SELECT hits, invalidations FROM waddle_recycling_stats();
+----
+3	3
+
+# UPDATE and DELETE invalidate.
+statement ok
+UPDATE recycling_invalidation_values SET value = value * 2;
+
+query I
+SELECT sum(value) FROM recycling_invalidation_values;
+----
+312
+
+statement ok
+DELETE FROM recycling_invalidation_values WHERE value > 100;
+
+query I
+SELECT sum(value) FROM recycling_invalidation_values;
+----
+110
+
+query III
+SELECT hits, misses, invalidations FROM waddle_recycling_stats();
+----
+3	5	5
+
+# The grader wraps every statement in EXPLAIN ANALYZE; a write there still invalidates.
+statement ok
+EXPLAIN ANALYZE INSERT INTO recycling_invalidation_values VALUES (1000);
+
+query I
+SELECT sum(value) FROM recycling_invalidation_values;
+----
+1110
+
+query II
+SELECT misses, invalidations FROM waddle_recycling_stats();
+----
+6	6
+
+# A write while recycling is switched off still invalidates, so switching it back on is safe.
+statement ok
+SET waddle_recycling = false;
+
+statement ok
+INSERT INTO recycling_invalidation_values VALUES (10000);
+
+statement ok
+SET waddle_recycling = true;
+
+query I
+SELECT sum(value) FROM recycling_invalidation_values;
+----
+11110
+
+query II
+SELECT misses, invalidations FROM waddle_recycling_stats();
+----
+7	7
+
+# Schema changes invalidate: CREATE, ALTER and DROP.
+statement ok
+CREATE TABLE recycling_invalidation_other (value INTEGER);
+
+query I
+SELECT invalidations FROM waddle_recycling_stats();
+----
+8
+
+statement ok
+ALTER TABLE recycling_invalidation_values ADD COLUMN extra INTEGER;
+
+query I
+SELECT invalidations FROM waddle_recycling_stats();
+----
+9
+
+statement ok
+DROP TABLE recycling_invalidation_other;
+
+query II
+SELECT invalidations, current_bytes FROM waddle_recycling_stats();
+----
+10	0
+
+# ATTACH and DETACH change which tables exist without writing to a database; they invalidate too.
+statement ok
+ATTACH ':memory:' AS recycling_invalidation_attached;
+
+query I
+SELECT invalidations FROM waddle_recycling_stats();
+----
+11
+
+statement ok
+DETACH recycling_invalidation_attached;
+
+query I
+SELECT invalidations FROM waddle_recycling_stats();
+----
+12

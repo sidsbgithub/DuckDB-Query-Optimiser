@@ -1,0 +1,69 @@
+# name: test/sql/recycling_block_outside_filter.test
+# description: a filter from outside a block that the optimizers move into it keeps the block from being recycled
+# group: [sql]
+
+require waddle
+
+statement ok
+CREATE TABLE bo_title AS SELECT i AS id, i % 4 AS kind FROM range(4000) t(i);
+
+statement ok
+CREATE TABLE bo_info AS SELECT i AS id, (i * 7) % 4000 AS movie_id FROM range(20000) t(i);
+
+# The expected answers, without recycling.
+statement ok
+SET waddle_recycling = false;
+
+query II nosort cte_1
+WITH s AS (SELECT t.kind AS k, count(*) AS c FROM bo_title t JOIN bo_info i ON i.movie_id = t.id GROUP BY t.kind) SELECT * FROM s WHERE k = 1;
+----
+
+query II nosort cte_2
+WITH s AS (SELECT t.kind AS k, count(*) AS c FROM bo_title t JOIN bo_info i ON i.movie_id = t.id GROUP BY t.kind) SELECT * FROM s WHERE k = 2;
+----
+
+query II nosort cte_3
+WITH s AS (SELECT t.kind AS k, count(*) AS c FROM bo_title t JOIN bo_info i ON i.movie_id = t.id GROUP BY t.kind) SELECT * FROM s WHERE k = 3;
+----
+
+query II nosort subquery_1
+SELECT * FROM (SELECT t.kind AS k, count(*) AS c FROM bo_title t JOIN bo_info i ON i.movie_id = t.id GROUP BY t.kind) s WHERE s.k = 1;
+----
+
+query II nosort subquery_2
+SELECT * FROM (SELECT t.kind AS k, count(*) AS c FROM bo_title t JOIN bo_info i ON i.movie_id = t.id GROUP BY t.kind) s WHERE s.k = 2;
+----
+
+query II nosort subquery_3
+SELECT * FROM (SELECT t.kind AS k, count(*) AS c FROM bo_title t JOIN bo_info i ON i.movie_id = t.id GROUP BY t.kind) s WHERE s.k = 3;
+----
+
+statement ok
+SET waddle_recycling = true;
+
+# The block is the join under the grouping, and its key does not mention k. DuckDB pushes the filter on k through the
+# grouping to just above the block, and join ordering then moves it into the block's joins. Each statement must still
+# return its own group: neither the block nor the grouping above it may be captured under keys that leave k out.
+query II nosort cte_1
+WITH s AS (SELECT t.kind AS k, count(*) AS c FROM bo_title t JOIN bo_info i ON i.movie_id = t.id GROUP BY t.kind) SELECT * FROM s WHERE k = 1;
+----
+
+query II nosort cte_2
+WITH s AS (SELECT t.kind AS k, count(*) AS c FROM bo_title t JOIN bo_info i ON i.movie_id = t.id GROUP BY t.kind) SELECT * FROM s WHERE k = 2;
+----
+
+query II nosort cte_3
+WITH s AS (SELECT t.kind AS k, count(*) AS c FROM bo_title t JOIN bo_info i ON i.movie_id = t.id GROUP BY t.kind) SELECT * FROM s WHERE k = 3;
+----
+
+query II nosort subquery_1
+SELECT * FROM (SELECT t.kind AS k, count(*) AS c FROM bo_title t JOIN bo_info i ON i.movie_id = t.id GROUP BY t.kind) s WHERE s.k = 1;
+----
+
+query II nosort subquery_2
+SELECT * FROM (SELECT t.kind AS k, count(*) AS c FROM bo_title t JOIN bo_info i ON i.movie_id = t.id GROUP BY t.kind) s WHERE s.k = 2;
+----
+
+query II nosort subquery_3
+SELECT * FROM (SELECT t.kind AS k, count(*) AS c FROM bo_title t JOIN bo_info i ON i.movie_id = t.id GROUP BY t.kind) s WHERE s.k = 3;
+----

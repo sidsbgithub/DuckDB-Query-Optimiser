@@ -1,0 +1,61 @@
+# name: test/sql/recycling_join.test
+# description: self-join recycling keys use input positions, not SQL aliases
+# group: [sql]
+
+require waddle
+
+# These tests observe pipeline breakers; whole query results are tested in recycling_query_result.test.
+statement ok
+SET GLOBAL waddle_recycling_query_results = false;
+
+statement ok
+CREATE TABLE recycling_join_values AS SELECT i AS id FROM range(5) t(i);
+
+query I
+SELECT sum(left_side.id) FROM recycling_join_values left_side
+JOIN recycling_join_values right_side ON left_side.id = right_side.id;
+----
+10
+
+query I
+  select SUM(x.id) from recycling_join_values x
+  join recycling_join_values y on x.id=y.id;
+----
+10
+
+query IIII
+SELECT lookups, hits, misses, captures FROM waddle_recycling_stats();
+----
+3	1	2	2
+
+# A different join kind still replays the common build side; the join itself runs again.
+query I
+SELECT sum(left_side.id) FROM recycling_join_values left_side
+LEFT JOIN recycling_join_values right_side ON left_side.id = right_side.id;
+----
+10
+
+query IIII
+SELECT lookups, hits, misses, captures FROM waddle_recycling_stats();
+----
+5	2	3	3
+
+statement ok
+CREATE TABLE recycling_join_rhs AS SELECT i, i + 10 AS score FROM range(3) t(i);
+
+query II
+SELECT sum(l.id), sum(r.score) FROM recycling_join_values l
+JOIN recycling_join_rhs r ON l.id = r.i;
+----
+3	33
+
+query II
+SELECT sum(r.score), sum(l.id) FROM recycling_join_values l
+JOIN recycling_join_rhs r ON l.id = r.i;
+----
+33	3
+
+query IIII
+SELECT lookups, hits, misses, captures FROM waddle_recycling_stats();
+----
+9	3	6	6

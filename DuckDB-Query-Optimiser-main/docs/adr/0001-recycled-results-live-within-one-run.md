@@ -1,0 +1,3 @@
+# Recycled results live within one run
+
+The grader runs the warm-up and each timed run as separate processes that share one writable database file, so recycled results could be persisted into that file during the warm-up and replayed in every timed run. We deliberately keep recycled results in memory only, scoped to one run: persisting across runs exploits the harness rather than the ordered query stream, the warm-up is a correctness pass we do not control, and a reviewer would treat it as gaming the benchmark. Do not "optimize" this by writing to the database or to disk without first getting explicit approval from the course staff.

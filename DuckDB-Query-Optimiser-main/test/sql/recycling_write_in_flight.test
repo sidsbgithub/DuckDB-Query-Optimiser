@@ -1,0 +1,116 @@
+# name: test/sql/recycling_write_in_flight.test
+# description: while another connection's write is in flight, nothing is replayed or captured
+# group: [sql]
+
+require waddle
+
+# These tests observe pipeline breakers; whole query results are tested in recycling_query_result.test.
+statement ok
+SET GLOBAL waddle_recycling_query_results = false;
+
+# DuckDB makes a commit visible before it tells the extension, so a write is announced when it is planned and
+# blocks recycling until its commit has invalidated the cache. An open explicit transaction holds the write in
+# flight long enough to observe that deterministically.
+
+statement ok
+CREATE TABLE recycling_in_flight_values AS SELECT i AS value FROM range(1000) t(i);
+
+query I
+SELECT sum(value) FROM recycling_in_flight_values;
+----
+499500
+
+query III
+SELECT lookups, hits, captures FROM waddle_recycling_stats();
+----
+1	0	1
+
+statement ok con1
+BEGIN TRANSACTION;
+
+statement ok con1
+INSERT INTO recycling_in_flight_values VALUES (1000);
+
+# The uncommitted row is invisible here, but the recycled result must not be replayed, and no new one captured.
+query I con2
+SELECT sum(value) FROM recycling_in_flight_values;
+----
+499500
+
+query III con2
+SELECT lookups, hits, captures FROM waddle_recycling_stats();
+----
+1	0	1
+
+statement ok con1
+COMMIT;
+
+query I con2
+SELECT sum(value) FROM recycling_in_flight_values;
+----
+500500
+
+query I con2
+SELECT sum(value) FROM recycling_in_flight_values;
+----
+500500
+
+query IIII con2
+SELECT lookups, hits, captures, invalidations FROM waddle_recycling_stats();
+----
+3	1	2	2
+
+# A rolled-back write ends its flight too, and leaves the cache intact.
+statement ok con1
+BEGIN TRANSACTION;
+
+statement ok con1
+DELETE FROM recycling_in_flight_values;
+
+statement ok con1
+ROLLBACK;
+
+query I con2
+SELECT sum(value) FROM recycling_in_flight_values;
+----
+500500
+
+query IIII con2
+SELECT lookups, hits, captures, invalidations FROM waddle_recycling_stats();
+----
+4	2	2	2
+
+# A write to a temp table never invalidates, since temp tables are never recycled, so it blocks nothing.
+statement ok con1
+BEGIN TRANSACTION;
+
+statement ok con1
+CREATE TEMP TABLE recycling_in_flight_scratch AS SELECT 1 AS value;
+
+query I con2
+SELECT sum(value) FROM recycling_in_flight_values;
+----
+500500
+
+statement ok con1
+COMMIT;
+
+query IIII con2
+SELECT lookups, hits, captures, invalidations FROM waddle_recycling_stats();
+----
+5	3	2	2
+
+# A statement that writes announces its write once planned, after the optimizer hook has looked up, so it may replay
+# what it reads: its snapshot is the one the cache holds. The write then invalidates when it commits.
+statement ok
+CREATE TABLE recycling_in_flight_totals AS SELECT sum(value) AS total FROM recycling_in_flight_values;
+
+query I
+SELECT total FROM recycling_in_flight_totals;
+----
+500500
+
+query IIII
+SELECT lookups, hits, captures, invalidations FROM waddle_recycling_stats();
+----
+6	4	2	3

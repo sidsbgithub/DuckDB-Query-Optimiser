@@ -1,0 +1,88 @@
+# name: test/sql/recycling_budget.test
+# description: a capture over its share of the budget is aborted, the query continues, a refusal is not repeated, and bytes stay within the budget
+# group: [sql]
+
+require waddle
+
+# These tests observe pipeline breakers; whole query results are tested in recycling_query_result.test.
+statement ok
+SET GLOBAL waddle_recycling_query_results = false;
+
+statement ok
+SET waddle_recycling_max_bytes = 1;
+
+statement ok
+CREATE TABLE recycling_budget_values AS SELECT i AS value FROM range(12) t(i);
+
+query I
+SELECT sum(value) FROM recycling_budget_values;
+----
+66
+
+# The repeat misses again, but its capture was refused for its size: it is not copied only to be refused again.
+query I
+SELECT sum(value) FROM recycling_budget_values;
+----
+66
+
+query IIIIII
+SELECT lookups, hits, misses, captures, aborted_captures, peak_bytes FROM waddle_recycling_stats();
+----
+2	0	2	0	1	0
+
+# A result may hold a quarter of the budget: here a one-row result (one 262144-byte buffer block) but not a
+# multi-block one.
+statement ok
+SET waddle_recycling_max_bytes = 1100000;
+
+statement ok
+CREATE TABLE recycling_budget_groups AS SELECT i AS value FROM range(100000) t(i);
+
+query I
+SELECT max(value) FROM recycling_budget_groups;
+----
+99999
+
+query II
+SELECT captures, current_bytes > 0 FROM waddle_recycling_stats();
+----
+1	true
+
+# The inner aggregate's 100000 groups exceed the per-result cap: its capture is aborted and the query still
+# returns the vanilla answer. The outer one-row result is captured.
+query II
+SELECT count(*), sum(n) FROM (SELECT value, count(*) AS n FROM recycling_budget_groups GROUP BY value);
+----
+100000	100000
+
+query II
+SELECT captures, aborted_captures FROM waddle_recycling_stats();
+----
+2	2
+
+# The repeat hits at the outer aggregate, so the inner one neither runs nor aborts again.
+query II
+SELECT count(*), sum(n) FROM (SELECT value, count(*) AS n FROM recycling_budget_groups GROUP BY value);
+----
+100000	100000
+
+query III
+SELECT hits, captures, aborted_captures FROM waddle_recycling_stats();
+----
+1	2	2
+
+# A refusal holds only against the cap it exceeded: under this budget the sum refused above is captured.
+query I
+SELECT sum(value) FROM recycling_budget_values;
+----
+66
+
+query II
+SELECT captures, aborted_captures FROM waddle_recycling_stats();
+----
+3	2
+
+query II
+SELECT current_bytes <= 1100000, peak_bytes <= 1100000 FROM waddle_recycling_stats();
+----
+true	true

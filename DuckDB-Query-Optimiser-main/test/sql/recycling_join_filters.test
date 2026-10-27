@@ -1,0 +1,46 @@
+# name: test/sql/recycling_join_filters.test
+# description: a subtree that a join outside it filters at run time is captured without those filters, so its replay holds every row
+# group: [sql]
+
+require waddle
+
+# These tests observe pipeline breakers; whole query results are tested in recycling_query_result.test.
+statement ok
+SET GLOBAL waddle_recycling_query_results = false;
+
+statement ok
+CALL enable_logging('WaddleRecycling');
+
+statement ok
+SET waddle_recycling_diagnostics = true;
+
+# Keys far apart, so that DuckDB does not compress them into a smaller type, which would stop the join filter at
+# the compressing projection.
+statement ok
+CREATE TABLE jf_fact AS SELECT (i % 50000) * 1000000000000 AS k, i AS v FROM range(200000) t(i);
+
+statement ok
+CREATE TABLE jf_dim AS SELECT i * 7000000000000 AS k FROM range(10) t(i);
+
+# The same smallest and largest key as jf_dim, so the grouping below has the same key under a join with either; but
+# two keys jf_dim does not have.
+statement ok
+CREATE TABLE jf_other AS SELECT unnest([0, 1, 2, 63]) * 1000000000000 AS k;
+
+# The join pushes a filter on k from its build side, jf_dim, through the grouping into the scan of jf_fact. The
+# grouping is captured without the filter, which only skips rows that the join discards anyway.
+query II
+SELECT count(*), sum(a.n) FROM (SELECT k, count(*) AS n FROM jf_fact GROUP BY k) a JOIN jf_dim d ON d.k = a.k;
+----
+10	40
+
+# The join with jf_other replays the grouping, which therefore holds the groups jf_dim's filter would have skipped.
+query II
+SELECT count(*), sum(a.n) FROM (SELECT k, count(*) AS n FROM jf_fact GROUP BY k) a JOIN jf_other d ON d.k = a.k;
+----
+4	16
+
+query I
+SELECT count(*) FROM duckdb_logs WHERE type = 'WaddleRecycling' AND message LIKE 'hit breaker=aggregate %';
+----
+1

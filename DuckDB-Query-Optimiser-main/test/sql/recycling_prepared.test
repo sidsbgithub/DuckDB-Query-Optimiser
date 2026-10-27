@@ -1,0 +1,64 @@
+# name: test/sql/recycling_prepared.test
+# description: prepared statements never recycle unbound parameters or replay a stale plan
+# group: [sql]
+
+require waddle
+
+# These tests observe pipeline breakers; whole query results are tested in recycling_query_result.test.
+statement ok
+SET GLOBAL waddle_recycling_query_results = false;
+
+statement ok
+CREATE TABLE recycling_prepared_values AS SELECT i AS value FROM range(10) t(i);
+
+# At PREPARE time $1 is unbound, even when the optimizer pushes it into a scan filter.
+statement ok
+PREPARE count_above AS SELECT count(*) FROM recycling_prepared_values WHERE value > $1;
+
+query III
+SELECT lookups, captures, skipped_parameter FROM waddle_recycling_stats();
+----
+0	0	1
+
+# Each execution binds a constant, so different values never share a recycled result.
+query I
+EXECUTE count_above(3);
+----
+6
+
+query I
+EXECUTE count_above(5);
+----
+4
+
+query I
+EXECUTE count_above(3);
+----
+6
+
+query IIII
+SELECT lookups, hits, misses, captures FROM waddle_recycling_stats();
+----
+3	1	2	2
+
+# A plan prepared on a hit must not replay after a write invalidated the cache.
+query I
+SELECT sum(value) FROM recycling_prepared_values;
+----
+45
+
+statement ok
+PREPARE total AS SELECT sum(value) FROM recycling_prepared_values;
+
+statement ok
+INSERT INTO recycling_prepared_values VALUES (100);
+
+query I
+EXECUTE total;
+----
+145
+
+query I
+EXECUTE total;
+----
+145

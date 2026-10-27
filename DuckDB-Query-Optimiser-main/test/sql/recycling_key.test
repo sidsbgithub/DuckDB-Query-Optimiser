@@ -1,0 +1,74 @@
+# name: test/sql/recycling_key.test
+# description: recycling keys distinguish inputs and normalize query spelling
+# group: [sql]
+
+require waddle
+
+# These tests observe pipeline breakers; whole query results are tested in recycling_query_result.test.
+statement ok
+SET GLOBAL waddle_recycling_query_results = false;
+
+statement ok
+CREATE TABLE recycling_key_values AS SELECT i AS a, i * 2 AS b FROM range(12) t(i);
+
+query I
+SELECT sum(a) AS total FROM recycling_key_values;
+----
+66
+
+query I
+select SUM(a) AS renamed FROM recycling_key_values;
+----
+66
+
+query IIII
+SELECT lookups, hits, misses, captures FROM waddle_recycling_stats();
+----
+2	1	1	1
+
+query I
+SELECT sum(b) AS total FROM recycling_key_values;
+----
+132
+
+query IIII
+SELECT lookups, hits, misses, captures FROM waddle_recycling_stats();
+----
+3	1	2	2
+
+query I
+SELECT sum(a) FROM recycling_key_values WHERE a > 5;
+----
+51
+
+query IIII
+SELECT lookups, hits, misses, captures FROM waddle_recycling_stats();
+----
+4	1	3	3
+
+query I
+SELECT sum(a) FROM recycling_key_values WHERE a > 6;
+----
+45
+
+query IIII
+SELECT lookups, hits, misses, captures FROM waddle_recycling_stats();
+----
+5	1	4	4
+
+# The same aggregate under a different parent (here a join) must still hit.
+query I
+SELECT sum(c) FROM (SELECT a, count(*) AS c FROM recycling_key_values GROUP BY a) s;
+----
+12
+
+query I
+SELECT sum(s.c) FROM recycling_key_values v
+JOIN (SELECT a, count(*) AS c FROM recycling_key_values GROUP BY a) s ON v.a = s.a;
+----
+12
+
+query IIII
+SELECT lookups, hits, misses, captures FROM waddle_recycling_stats();
+----
+10	2	8	8

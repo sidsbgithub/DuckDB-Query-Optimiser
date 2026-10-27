@@ -1,0 +1,80 @@
+# name: test/sql/recycling_outermost.test
+# description: nested recyclable subtrees are looked up outermost first, and every one that misses is captured
+# group: [sql]
+
+require waddle
+
+# These tests observe pipeline breakers; whole query results are tested in recycling_query_result.test.
+statement ok
+SET GLOBAL waddle_recycling_query_results = false;
+
+statement ok
+CALL enable_logging('WaddleRecycling');
+
+statement ok
+SET waddle_recycling_diagnostics = true;
+
+statement ok
+CREATE TABLE recycling_outermost_fact AS SELECT i AS id, i % 4 AS dimension_id FROM range(100) t(i);
+
+statement ok
+CREATE TABLE recycling_outermost_dimension(id INTEGER, active BOOLEAN, label VARCHAR);
+
+statement ok
+INSERT INTO recycling_outermost_dimension VALUES (0, true, 'zero'), (1, false, 'one'), (2, true, 'two'), (3, true, 'three');
+
+# An aggregate over a hash join has two recyclable subtrees: the aggregate and the join's build side inside it.
+# Both miss and both are captured.
+query II rowsort
+SELECT d.label, count(*) FROM recycling_outermost_fact f
+JOIN (SELECT id, label FROM recycling_outermost_dimension WHERE active) d ON f.dimension_id = d.id
+GROUP BY d.label;
+----
+three	25
+two	25
+zero	25
+
+query IIII
+SELECT lookups, hits, misses, captures FROM waddle_recycling_stats();
+----
+2	0	2	2
+
+# An exact repeat replays the whole aggregate, and nothing inside it is looked up.
+query II rowsort
+SELECT d.label, count(*) FROM recycling_outermost_fact f
+JOIN (SELECT id, label FROM recycling_outermost_dimension WHERE active) d ON f.dimension_id = d.id
+GROUP BY d.label;
+----
+three	25
+two	25
+zero	25
+
+query IIII
+SELECT lookups, hits, misses, captures FROM waddle_recycling_stats();
+----
+3	1	2	2
+
+# A different aggregate over the same join misses at its root, then replays the build side inside it.
+query II rowsort
+SELECT d.label, sum(f.id) FROM recycling_outermost_fact f
+JOIN (SELECT id, label FROM recycling_outermost_dimension WHERE active) d ON f.dimension_id = d.id
+GROUP BY d.label;
+----
+three	1275
+two	1250
+zero	1200
+
+query IIII
+SELECT lookups, hits, misses, captures FROM waddle_recycling_stats();
+----
+5	2	3	3
+
+query I
+SELECT regexp_extract(message, '^([a-z]+) breaker=([a-z_]+) ', ['event', 'breaker'])::VARCHAR
+FROM duckdb_logs WHERE type = 'WaddleRecycling';
+----
+{'event': miss, 'breaker': aggregate}
+{'event': miss, 'breaker': join_build_side}
+{'event': hit, 'breaker': aggregate}
+{'event': miss, 'breaker': aggregate}
+{'event': hit, 'breaker': join_build_side}

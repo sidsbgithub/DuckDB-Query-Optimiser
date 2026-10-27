@@ -1,0 +1,96 @@
+# name: test/sql/recycling_eviction.test
+# description: a full cache evicts the least-recently-used recycled result
+# group: [sql]
+
+require waddle
+
+# These tests observe pipeline breakers; whole query results are tested in recycling_query_result.test.
+statement ok
+SET GLOBAL waddle_recycling_query_results = false;
+
+statement ok
+CREATE TABLE recycling_eviction_values AS SELECT i AS value FROM range(12) t(i);
+
+# Each result below is one row in one buffer block (262144 bytes). A result may hold a quarter of the budget, so
+# the budget holds four of them but not five.
+statement ok
+SET waddle_recycling_max_bytes = 1100000;
+
+# Capture max, min, count and sum.
+query I
+SELECT max(value) FROM recycling_eviction_values;
+----
+11
+
+query I
+SELECT min(value) FROM recycling_eviction_values;
+----
+0
+
+query I
+SELECT count(value) FROM recycling_eviction_values;
+----
+12
+
+query I
+SELECT sum(value) FROM recycling_eviction_values;
+----
+66
+
+# Replaying max makes min the least-recently-used result, although max was captured first.
+query I
+SELECT max(value) FROM recycling_eviction_values;
+----
+11
+
+query IIIII
+SELECT hits, misses, captures, evictions, current_bytes > 0 FROM waddle_recycling_stats();
+----
+1	4	4	0	true
+
+# Capturing avg needs room: min is evicted, not max.
+query I
+SELECT avg(value) FROM recycling_eviction_values;
+----
+5.5
+
+query III
+SELECT hits, misses, evictions FROM waddle_recycling_stats();
+----
+1	5	1
+
+query I
+SELECT max(value) FROM recycling_eviction_values;
+----
+11
+
+query III
+SELECT hits, misses, evictions FROM waddle_recycling_stats();
+----
+2	5	1
+
+query I
+SELECT min(value) FROM recycling_eviction_values;
+----
+0
+
+# min missed and was captured again, evicting count, now the least recently used.
+query III
+SELECT hits, misses, evictions FROM waddle_recycling_stats();
+----
+2	6	2
+
+query I
+SELECT max(value) FROM recycling_eviction_values;
+----
+11
+
+query III
+SELECT hits, misses, evictions FROM waddle_recycling_stats();
+----
+3	6	2
+
+query II
+SELECT current_bytes <= 1100000, peak_bytes <= 1100000 FROM waddle_recycling_stats();
+----
+true	true

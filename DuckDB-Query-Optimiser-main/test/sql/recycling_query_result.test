@@ -1,0 +1,231 @@
+# name: test/sql/recycling_query_result.test
+# description: a repeated statement, alone or as a subquery, replays the earlier statement's whole result
+# group: [sql]
+
+require waddle
+
+statement ok
+SET threads = 4;
+
+statement ok
+SET preserve_insertion_order = false;
+
+statement ok
+CREATE TABLE qr_items AS SELECT i AS id, i % 7 AS grp, (i * 37) % 1000 AS score FROM range(20000) t(i);
+
+statement ok
+CREATE TABLE qr_tags AS SELECT i AS id, i % 3 AS tag FROM range(20000) t(i);
+
+# The first run captures the ordered result.
+query III
+SELECT id, grp, score FROM qr_items WHERE grp = 3 ORDER BY score DESC, id LIMIT 5;
+----
+3027	3	999
+10027	3	999
+17027	3	999
+2054	3	998
+9054	3	998
+
+query II
+SELECT query_hits, query_captures FROM waddle_recycling_stats();
+----
+0	1
+
+# Whitespace and query locations do not change the key; the replay keeps the order.
+query III
+SELECT id, grp, score   FROM qr_items
+WHERE grp = 3 ORDER BY score DESC, id LIMIT 5;
+----
+3027	3	999
+10027	3	999
+17027	3	999
+2054	3	998
+9054	3	998
+
+query II
+SELECT query_hits, query_captures FROM waddle_recycling_stats();
+----
+1	1
+
+# A long ordered result is replayed in order.
+query II nosort ordered_items
+SELECT id, score FROM qr_items ORDER BY score, id;
+----
+
+query II nosort ordered_items
+SELECT id, score FROM qr_items ORDER BY score, id;
+----
+
+query I
+SELECT query_hits FROM waddle_recycling_stats();
+----
+2
+
+# A different constant is a different statement.
+query I
+SELECT count(*) FROM qr_items WHERE grp = 4;
+----
+2857
+
+query I
+SELECT count(*) FROM qr_items WHERE grp = 5;
+----
+2857
+
+# A correlated EXISTS subquery repeats as a whole.
+query II
+SELECT grp, count(*) FROM qr_items i WHERE EXISTS (SELECT 1 FROM qr_tags t WHERE t.id = i.id AND t.tag = 1) GROUP BY grp ORDER BY grp;
+----
+0	953
+1	953
+2	952
+3	952
+4	953
+5	952
+6	952
+
+query II
+SELECT grp, count(*) FROM qr_items i WHERE EXISTS (SELECT 1 FROM qr_tags t WHERE t.id = i.id AND t.tag = 1) GROUP BY grp ORDER BY grp;
+----
+0	953
+1	953
+2	952
+3	952
+4	953
+5	952
+6	952
+
+# A drill-down that filters an earlier statement replays it as a subquery.
+query II
+SELECT grp, total FROM (SELECT grp, sum(score) AS total FROM qr_items GROUP BY grp ORDER BY grp) d WHERE d.grp > 4 ORDER BY grp;
+----
+5	1426709
+6	1426418
+
+# SET VARIABLE writes no table, so it invalidates nothing.
+statement ok
+SET VARIABLE hits_before = (SELECT query_hits FROM waddle_recycling_stats());
+
+query II
+SELECT grp, total FROM (SELECT grp, sum(score) AS total FROM qr_items GROUP BY grp ORDER BY grp) d WHERE d.grp < 2 ORDER BY grp;
+----
+0	1427127
+1	1427873
+
+query I
+SELECT query_hits - getvariable('hits_before') FROM waddle_recycling_stats();
+----
+0
+
+query II
+SELECT grp, sum(score) AS total FROM qr_items GROUP BY grp ORDER BY grp;
+----
+0	1427127
+1	1427873
+2	1427582
+3	1427291
+4	1427000
+5	1426709
+6	1426418
+
+query II
+SELECT grp, total FROM (SELECT grp, sum(score) AS total FROM qr_items GROUP BY grp ORDER BY grp) d WHERE d.grp = 3;
+----
+3	1427291
+
+query I
+SELECT query_hits - getvariable('hits_before') FROM waddle_recycling_stats();
+----
+1
+
+# Later pages of an ordered statement replay from the first rows its first page captured. Late materialization
+# turns a small single-table Top-N into a join on row ids, which leaves no page to widen, so it is off here.
+statement ok
+SET late_materialization_max_rows = 0;
+
+query II
+SELECT id, score FROM qr_items ORDER BY score DESC, id LIMIT 3 OFFSET 0;
+----
+27	999
+1027	999
+2027	999
+
+statement ok
+SET VARIABLE hits_before = (SELECT query_hits FROM waddle_recycling_stats());
+
+query II
+SELECT id, score FROM qr_items ORDER BY score DESC, id LIMIT 3 OFFSET 3;
+----
+3027	999
+4027	999
+5027	999
+
+query I
+SELECT query_hits - getvariable('hits_before') FROM waddle_recycling_stats();
+----
+1
+
+# A page beyond the captured rows executes, and is right.
+query II
+SELECT id, score FROM qr_items ORDER BY score DESC, id LIMIT 3 OFFSET 5000;
+----
+777	749
+1777	749
+2777	749
+
+query I
+SELECT query_hits - getvariable('hits_before') FROM waddle_recycling_stats();
+----
+1
+
+# When the captured rows are the whole ordered result, any page replays, including an empty one.
+query I
+SELECT id FROM qr_items WHERE grp = 6 AND score = 999 ORDER BY id LIMIT 2 OFFSET 2;
+----
+14027
+
+query I
+SELECT id FROM qr_items WHERE grp = 6 AND score = 999 ORDER BY id LIMIT 2 OFFSET 4;
+----
+
+query I
+SELECT query_hits - getvariable('hits_before') FROM waddle_recycling_stats();
+----
+2
+
+# Volatile functions are never replayed.
+query I
+SELECT count(DISTINCT r) FROM (SELECT random() AS r FROM range(2)) UNION ALL SELECT count(DISTINCT r) FROM (SELECT random() AS r FROM range(2));
+----
+2
+2
+
+# A committed write discards every result.
+statement ok
+INSERT INTO qr_items VALUES (100000, 3, 5000);
+
+query III
+SELECT id, grp, score FROM qr_items WHERE grp = 3 ORDER BY score DESC, id LIMIT 5;
+----
+100000	3	5000
+3027	3	999
+10027	3	999
+17027	3	999
+2054	3	998
+
+# The setting turns query-result replay off.
+statement ok
+SET waddle_recycling_query_results = false;
+
+statement ok
+SET VARIABLE lookups_before = (SELECT query_lookups FROM waddle_recycling_stats());
+
+query I
+SELECT count(*) FROM qr_items;
+----
+20001
+
+query I
+SELECT query_lookups - getvariable('lookups_before') FROM waddle_recycling_stats();
+----
+0

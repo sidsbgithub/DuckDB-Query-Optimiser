@@ -1,0 +1,42 @@
+# name: test/sql/recycling_invalidation_concurrent.test
+# description: a capture that read data from before a concurrent write commits is never published
+# group: [sql]
+
+require waddle
+
+# These tests observe pipeline breakers; whole query results are tested in recycling_query_result.test.
+statement ok
+SET GLOBAL waddle_recycling_query_results = false;
+
+statement ok
+CREATE TABLE recycling_concurrent_values AS SELECT i AS value FROM range(1000000) t(i);
+
+statement ok
+SET GLOBAL threads = 4;
+
+# Every connection writes and then reads, so reads run while other connections commit writes. Answers vary
+# with timing here; a stale capture would surface in the final queries below.
+concurrentloop threadid 0 8
+
+loop i 0 10
+
+statement ok
+INSERT INTO recycling_concurrent_values VALUES (1000000 + ${threadid} * 10 + ${i});
+
+statement ok
+SELECT count(*), sum(n) FROM (SELECT value % 100000 AS bucket, count(*) AS n FROM recycling_concurrent_values GROUP BY bucket);
+
+endloop
+
+endloop
+
+# No more writes: whatever the cache holds must reflect all 80 inserted rows.
+query II
+SELECT count(*), sum(n) FROM (SELECT value % 100000 AS bucket, count(*) AS n FROM recycling_concurrent_values GROUP BY bucket);
+----
+100000	1000080
+
+query II
+SELECT count(*), sum(n) FROM (SELECT value % 100000 AS bucket, count(*) AS n FROM recycling_concurrent_values GROUP BY bucket);
+----
+100000	1000080

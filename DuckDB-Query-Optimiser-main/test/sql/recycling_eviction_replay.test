@@ -1,0 +1,47 @@
+# name: test/sql/recycling_eviction_replay.test
+# description: a recycled result evicted while other connections replay it keeps their answers intact
+# group: [sql]
+
+require waddle
+
+# These tests observe pipeline breakers; whole query results are tested in recycling_query_result.test.
+statement ok
+SET GLOBAL waddle_recycling_query_results = false;
+
+foreach table a b c d e f g h
+
+statement ok
+CREATE TABLE recycling_replay_${table} AS SELECT i AS value FROM range(100000) t(i);
+
+endloop
+
+# A result's size grows with the threads that captured it, so fix them. Each 100000-group result then takes about
+# 1.6 to 2.6 MB, within its quarter of the budget (3 MB), and the budget holds about five of the eight tables'
+# results, so every capture evicts another while concurrent connections may still be replaying it.
+statement ok
+SET GLOBAL threads = 4;
+
+statement ok
+SET GLOBAL waddle_recycling_max_bytes = 12000000;
+
+concurrentloop threadid 0 8
+
+loop i 0 10
+
+foreach table a b c d e f g h
+
+query II
+SELECT count(*), sum(n) FROM (SELECT value, count(*) AS n FROM recycling_replay_${table} GROUP BY value);
+----
+100000	100000
+
+endloop
+
+endloop
+
+endloop
+
+query IIII
+SELECT hits > 0, evictions > 0, current_bytes <= 12000000, peak_bytes <= 12000000 FROM waddle_recycling_stats();
+----
+true	true	true	true

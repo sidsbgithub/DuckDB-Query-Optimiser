@@ -1,0 +1,216 @@
+# name: test/sql/recycling_block.test
+# description: statements that repeat a block (the joins and filters under a select list or grouping) replay it, whatever columns they read
+# group: [sql]
+
+require waddle
+
+statement ok
+SET threads = 4;
+
+statement ok
+SET preserve_insertion_order = false;
+
+statement ok
+CREATE TABLE bl_person AS SELECT i AS id, 'p' || (i % 997) AS name, CASE WHEN i % 5 = 0 THEN NULL WHEN i % 2 = 0 THEN 'f' ELSE 'm' END AS gender FROM range(3000) t(i);
+
+statement ok
+CREATE TABLE bl_movie AS SELECT i AS id, 1990 + i % 30 AS year, i % 4 AS kind FROM range(800) t(i);
+
+# Credits for persons 3000-3099 have no person: the LEFT JOIN below keeps them with NULL columns.
+statement ok
+CREATE TABLE bl_credit AS SELECT i AS id, (i * 7) % 3100 AS person_id, (i * 13) % 800 AS movie_id, i % 3 AS role, i % 11 AS nr FROM range(40000) t(i);
+
+# The expected answers, without recycling.
+statement ok
+SET waddle_recycling = false;
+
+query TI rowsort by_name
+SELECT p.name, count(*) FROM bl_credit c JOIN bl_movie m ON m.id = c.movie_id JOIN bl_person p ON p.id = c.person_id WHERE m.year BETWEEN 2000 AND 2005 GROUP BY p.name;
+----
+
+query TI rowsort by_gender
+SELECT coalesce(p.gender, 'unknown'), count(DISTINCT c.person_id) FROM bl_credit c JOIN bl_movie m ON m.id = c.movie_id JOIN bl_person p ON p.id = c.person_id WHERE m.year BETWEEN 2000 AND 2005 GROUP BY 1;
+----
+
+query II rowsort by_year
+SELECT m.year, count(*) FROM bl_credit c JOIN bl_movie m ON m.id = c.movie_id JOIN bl_person p ON p.id = c.person_id WHERE m.year BETWEEN 2000 AND 2005 GROUP BY m.year;
+----
+
+query TI rowsort by_name_later
+SELECT p.name, count(*) FROM bl_credit c JOIN bl_movie m ON m.id = c.movie_id JOIN bl_person p ON p.id = c.person_id WHERE m.year BETWEEN 2003 AND 2008 GROUP BY p.name;
+----
+
+query TI rowsort by_gender_later
+SELECT coalesce(p.gender, 'unknown'), count(DISTINCT c.person_id) FROM bl_credit c JOIN bl_movie m ON m.id = c.movie_id JOIN bl_person p ON p.id = c.person_id WHERE m.year BETWEEN 2003 AND 2008 GROUP BY 1;
+----
+
+query TIII nosort page_later
+SELECT p.name, c.id, c.person_id, p.id FROM bl_credit c JOIN bl_movie m ON m.id = c.movie_id JOIN bl_person p ON p.id = c.person_id WHERE m.year BETWEEN 2003 AND 2008 ORDER BY p.name, c.id LIMIT 7;
+----
+
+query IIT rowsort outer_first
+SELECT c.role, count(*), max(p.name) FROM bl_credit c LEFT JOIN bl_person p ON p.id = c.person_id WHERE c.nr < 5 GROUP BY c.role;
+----
+
+query TII rowsort outer_second
+SELECT p.gender, count(*), count(c.person_id) FROM bl_credit c LEFT JOIN bl_person p ON p.id = c.person_id WHERE c.nr < 5 GROUP BY p.gender;
+----
+
+query TII rowsort outer_third
+SELECT p.name, count(*), sum(c.nr) FROM bl_credit c LEFT JOIN bl_person p ON p.id = c.person_id WHERE c.nr < 5 GROUP BY p.name;
+----
+
+query IIRR rowsort shared_cte
+WITH films AS (SELECT c.person_id, count(DISTINCT c.movie_id) AS n FROM bl_credit c JOIN bl_movie m ON m.id = c.movie_id WHERE m.kind = 1 GROUP BY c.person_id)
+SELECT count(*), max(f.n), avg(f.n), sum(f.n) FILTER (WHERE f.person_id % 2 = 0) FROM films f JOIN bl_person p ON p.id = f.person_id;
+----
+
+query TIR rowsort shared_cte_again
+WITH films AS (SELECT c.person_id, count(DISTINCT c.movie_id) AS n FROM bl_credit c JOIN bl_movie m ON m.id = c.movie_id WHERE m.kind = 1 GROUP BY c.person_id)
+SELECT p.gender, count(*), avg(f.n) FROM films f JOIN bl_person p ON p.id = f.person_id GROUP BY p.gender;
+----
+
+query IIII rowsort copied_cte
+WITH g AS (SELECT c.role, m.kind, count(*) AS n FROM bl_credit c JOIN bl_movie m ON m.id = c.movie_id WHERE m.year > 2010 GROUP BY c.role, m.kind)
+SELECT a.role, a.kind, a.n, b.n FROM g a JOIN g b ON a.role = b.role AND a.kind = b.kind ORDER BY a.n LIMIT 5;
+----
+
+statement ok
+SET waddle_recycling = true;
+
+# A family's first statement is not captured; it counts the block's rows.
+query TI rowsort by_name
+SELECT p.name, count(*) FROM bl_credit c JOIN bl_movie m ON m.id = c.movie_id JOIN bl_person p ON p.id = c.person_id WHERE m.year BETWEEN 2000 AND 2005 GROUP BY p.name;
+----
+
+# The second repeats the block, which its count shows fits: it captures the block with every column its family has
+# read.
+query TI rowsort by_gender
+SELECT coalesce(p.gender, 'unknown'), count(DISTINCT c.person_id) FROM bl_credit c JOIN bl_movie m ON m.id = c.movie_id JOIN bl_person p ON p.id = c.person_id WHERE m.year BETWEEN 2000 AND 2005 GROUP BY 1;
+----
+
+statement ok
+SET VARIABLE hits_before = (SELECT hits FROM waddle_recycling_stats());
+
+# The third reads a column the block reads for its filter, and replays the block.
+query II rowsort by_year
+SELECT m.year, count(*) FROM bl_credit c JOIN bl_movie m ON m.id = c.movie_id JOIN bl_person p ON p.id = c.person_id WHERE m.year BETWEEN 2000 AND 2005 GROUP BY m.year;
+----
+
+query I
+SELECT hits - getvariable('hits_before') FROM waddle_recycling_stats();
+----
+1
+
+# Other constants: the block with the first constants was counted, and is small enough that this one is captured
+# without a count of its own. The family already knows which columns to keep.
+query TI rowsort by_name_later
+SELECT p.name, count(*) FROM bl_credit c JOIN bl_movie m ON m.id = c.movie_id JOIN bl_person p ON p.id = c.person_id WHERE m.year BETWEEN 2003 AND 2008 GROUP BY p.name;
+----
+
+statement ok
+SET VARIABLE hits_before = (SELECT hits FROM waddle_recycling_stats());
+
+query TI rowsort by_gender_later
+SELECT coalesce(p.gender, 'unknown'), count(DISTINCT c.person_id) FROM bl_credit c JOIN bl_movie m ON m.id = c.movie_id JOIN bl_person p ON p.id = c.person_id WHERE m.year BETWEEN 2003 AND 2008 GROUP BY 1;
+----
+
+query I
+SELECT hits - getvariable('hits_before') FROM waddle_recycling_stats();
+----
+1
+
+# A column no statement read before is a miss. Columns the joins make equal may share a captured column.
+query TIII nosort page_later
+SELECT p.name, c.id, c.person_id, p.id FROM bl_credit c JOIN bl_movie m ON m.id = c.movie_id JOIN bl_person p ON p.id = c.person_id WHERE m.year BETWEEN 2003 AND 2008 ORDER BY p.name, c.id LIMIT 7;
+----
+
+query TI rowsort by_name_later
+SELECT p.name, count(*) FROM bl_credit c JOIN bl_movie m ON m.id = c.movie_id JOIN bl_person p ON p.id = c.person_id WHERE m.year BETWEEN 2003 AND 2008 GROUP BY p.name;
+----
+
+# An outer join's NULL columns replay as NULL.
+query IIT rowsort outer_first
+SELECT c.role, count(*), max(p.name) FROM bl_credit c LEFT JOIN bl_person p ON p.id = c.person_id WHERE c.nr < 5 GROUP BY c.role;
+----
+
+query TII rowsort outer_second
+SELECT p.gender, count(*), count(c.person_id) FROM bl_credit c LEFT JOIN bl_person p ON p.id = c.person_id WHERE c.nr < 5 GROUP BY p.gender;
+----
+
+query TII rowsort outer_third
+SELECT p.name, count(*), sum(c.nr) FROM bl_credit c LEFT JOIN bl_person p ON p.id = c.person_id WHERE c.nr < 5 GROUP BY p.name;
+----
+
+# A pipeline breaker above a block has the same key whether the block is joined, captured or replayed.
+query IIRR rowsort shared_cte
+WITH films AS (SELECT c.person_id, count(DISTINCT c.movie_id) AS n FROM bl_credit c JOIN bl_movie m ON m.id = c.movie_id WHERE m.kind = 1 GROUP BY c.person_id)
+SELECT count(*), max(f.n), avg(f.n), sum(f.n) FILTER (WHERE f.person_id % 2 = 0) FROM films f JOIN bl_person p ON p.id = f.person_id;
+----
+
+statement ok
+SET VARIABLE hits_before = (SELECT hits FROM waddle_recycling_stats());
+
+query TIR rowsort shared_cte_again
+WITH films AS (SELECT c.person_id, count(DISTINCT c.movie_id) AS n FROM bl_credit c JOIN bl_movie m ON m.id = c.movie_id WHERE m.kind = 1 GROUP BY c.person_id)
+SELECT p.gender, count(*), avg(f.n) FROM films f JOIN bl_person p ON p.id = f.person_id GROUP BY p.gender;
+----
+
+query I
+SELECT hits - getvariable('hits_before') > 0 FROM waddle_recycling_stats();
+----
+true
+
+# A CTE that the optimizer inlines by copying keeps its definition materialized instead, since a block cannot be
+# copied.
+query IIII rowsort copied_cte
+WITH g AS (SELECT c.role, m.kind, count(*) AS n FROM bl_credit c JOIN bl_movie m ON m.id = c.movie_id WHERE m.year > 2010 GROUP BY c.role, m.kind)
+SELECT a.role, a.kind, a.n, b.n FROM g a JOIN g b ON a.role = b.role AND a.kind = b.kind ORDER BY a.n LIMIT 5;
+----
+
+query IIII rowsort copied_cte
+WITH g AS (SELECT c.role, m.kind, count(*) AS n FROM bl_credit c JOIN bl_movie m ON m.id = c.movie_id WHERE m.year > 2010 GROUP BY c.role, m.kind)
+SELECT a.role, a.kind, a.n, b.n FROM g a JOIN g b ON a.role = b.role AND a.kind = b.kind ORDER BY a.n LIMIT 5;
+----
+
+# With insertion order preserved, only a grouping hides the order of replayed rows.
+statement ok
+SET preserve_insertion_order = true;
+
+query TIII nosort page_later
+SELECT p.name, c.id, c.person_id, p.id FROM bl_credit c JOIN bl_movie m ON m.id = c.movie_id JOIN bl_person p ON p.id = c.person_id WHERE m.year BETWEEN 2003 AND 2008 ORDER BY p.name, c.id LIMIT 7;
+----
+
+query TI rowsort by_gender_later
+SELECT coalesce(p.gender, 'unknown'), count(DISTINCT c.person_id) FROM bl_credit c JOIN bl_movie m ON m.id = c.movie_id JOIN bl_person p ON p.id = c.person_id WHERE m.year BETWEEN 2003 AND 2008 GROUP BY 1;
+----
+
+# A write invalidates block results like any other.
+statement ok
+INSERT INTO bl_credit VALUES (40000, 1, 1, 0, 0);
+
+statement ok
+SET preserve_insertion_order = false;
+
+query I
+SELECT count(*) FROM (SELECT p.name, count(*) FROM bl_credit c JOIN bl_movie m ON m.id = c.movie_id JOIN bl_person p ON p.id = c.person_id WHERE m.year BETWEEN 2000 AND 2005 GROUP BY p.name);
+----
+<REGEX>:\d+
+
+# Verification replans each statement and compares it with DuckDB's unoptimized execution.
+statement ok
+PRAGMA enable_verification;
+
+query TI rowsort
+SELECT coalesce(p.gender, 'unknown'), count(DISTINCT c.person_id) FROM bl_credit c JOIN bl_movie m ON m.id = c.movie_id JOIN bl_person p ON p.id = c.person_id WHERE m.year BETWEEN 2003 AND 2008 AND c.id < 100 GROUP BY 1;
+----
+f	9
+m	7
+unknown	4
+
+query TI rowsort
+SELECT coalesce(p.gender, 'unknown'), count(DISTINCT c.person_id) FROM bl_credit c JOIN bl_movie m ON m.id = c.movie_id JOIN bl_person p ON p.id = c.person_id WHERE m.year BETWEEN 2003 AND 2008 AND c.id < 100 GROUP BY 1;
+----
+f	9
+m	7
+unknown	4

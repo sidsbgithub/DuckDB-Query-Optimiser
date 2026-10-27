@@ -1,0 +1,44 @@
+# name: test/sql/recycling_key_topn.test
+# description: a Top-N dynamic filter cannot contaminate an aggregate's recycled result
+# group: [sql]
+
+require waddle
+
+# These tests observe pipeline breakers; whole query results are tested in recycling_query_result.test.
+statement ok
+SET GLOBAL waddle_recycling_query_results = false;
+
+statement ok
+CREATE TABLE recycling_topn_values AS SELECT i AS id FROM range(1000) t(i);
+
+query II
+SELECT id, count(*) AS n FROM recycling_topn_values GROUP BY id ORDER BY id DESC LIMIT 2;
+----
+999	1
+998	1
+
+query II
+SELECT id, count(*) AS n FROM recycling_topn_values GROUP BY id ORDER BY id ASC LIMIT 2;
+----
+0	1
+1	1
+
+query I
+SELECT sum(n) FROM (
+    SELECT id, count(*) AS n FROM recycling_topn_values GROUP BY id
+);
+----
+1000
+
+# The full aggregate can hit later; neither Top-N query published a partial result.
+query I
+SELECT sum(n) FROM (
+    SELECT id, count(*) AS n FROM recycling_topn_values GROUP BY id
+);
+----
+1000
+
+query IIII
+SELECT lookups, hits, misses, captures FROM waddle_recycling_stats();
+----
+3	1	2	2

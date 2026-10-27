@@ -1,0 +1,93 @@
+# name: test/sql/recycling_order_sensitive.test
+# description: ORDER BY, LIMIT, Top-N and window never root a recyclable subtree; the aggregate beneath them does
+# group: [sql]
+
+require waddle
+
+# These tests observe pipeline breakers; whole query results are tested in recycling_query_result.test.
+statement ok
+SET GLOBAL waddle_recycling_query_results = false;
+
+statement ok
+SET threads = 6;
+
+statement ok
+CREATE TABLE recycling_order_values AS SELECT i % 5 AS key, i FROM range(100000) t(i);
+
+# Order-sensitive operators without a pipeline breaker beneath them are never looked up.
+query I
+SELECT i FROM recycling_order_values ORDER BY i DESC LIMIT 2;
+----
+99999
+99998
+
+query II
+SELECT lookups, skipped_unsupported FROM waddle_recycling_stats();
+----
+0	0
+
+# GROUP BY ... ORDER BY ... LIMIT captures the aggregate, not the Top-N above it.
+query II
+SELECT key, count(*) AS n FROM recycling_order_values GROUP BY key ORDER BY n DESC, key LIMIT 2;
+----
+0	20000
+1	20000
+
+query IIII
+SELECT lookups, hits, misses, captures FROM waddle_recycling_stats();
+----
+1	0	1	1
+
+# A different ORDER BY and LIMIT above the same aggregate hits.
+query II
+SELECT key, count(*) AS n FROM recycling_order_values GROUP BY key ORDER BY n, key DESC LIMIT 1;
+----
+4	20000
+
+query IIII
+SELECT lookups, hits, misses, captures FROM waddle_recycling_stats();
+----
+2	1	1	1
+
+# The capture beneath the LIMIT stored every group, so the un-limited query gets the full answer.
+query II rowsort
+SELECT key, count(*) AS n FROM recycling_order_values GROUP BY key;
+----
+0	20000
+1	20000
+2	20000
+3	20000
+4	20000
+
+query IIII
+SELECT lookups, hits, misses, captures FROM waddle_recycling_stats();
+----
+3	2	1	1
+
+# A window above the aggregate also leaves the aggregate recyclable.
+query III rowsort
+SELECT key, n, row_number() OVER (ORDER BY key) FROM (
+    SELECT key, count(*) AS n FROM recycling_order_values GROUP BY key
+);
+----
+0	20000	1
+1	20000	2
+2	20000	3
+3	20000	4
+4	20000	5
+
+query IIII
+SELECT lookups, hits, misses, captures FROM waddle_recycling_stats();
+----
+4	3	1	1
+
+# An aggregate over a LIMIT depends on which rows the LIMIT happened to keep: skipped.
+query I
+SELECT count(*) FROM (SELECT key FROM recycling_order_values LIMIT 7);
+----
+7
+
+query II
+SELECT lookups, skipped_unsupported FROM waddle_recycling_stats();
+----
+4	1

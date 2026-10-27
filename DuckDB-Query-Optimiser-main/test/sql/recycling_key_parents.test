@@ -1,0 +1,56 @@
+# name: test/sql/recycling_key_parents.test
+# description: optimized aggregate outputs determine reuse under different parents
+# group: [sql]
+
+require waddle
+
+# These tests observe pipeline breakers; whole query results are tested in recycling_query_result.test.
+statement ok
+SET GLOBAL waddle_recycling_query_results = false;
+
+statement ok
+CREATE TABLE recycling_parent_values AS SELECT i % 5 AS group_id FROM range(20) t(i);
+
+query II rowsort
+SELECT group_id, n FROM (
+    SELECT group_id, count(*) AS n FROM recycling_parent_values GROUP BY group_id
+);
+----
+0	4
+1	4
+2	4
+3	4
+4	4
+
+query II rowsort
+SELECT n, group_id FROM (
+    SELECT group_id, count(*) AS n FROM recycling_parent_values GROUP BY group_id
+);
+----
+4	0
+4	1
+4	2
+4	3
+4	4
+
+query IIII
+SELECT lookups, hits, misses, captures FROM waddle_recycling_stats();
+----
+2	1	1	1
+
+# The unused count is pruned from this optimized aggregate, so it must miss.
+query I rowsort
+SELECT group_id FROM (
+    SELECT group_id, count(*) AS n FROM recycling_parent_values GROUP BY group_id
+);
+----
+0
+1
+2
+3
+4
+
+query IIII
+SELECT lookups, hits, misses, captures FROM waddle_recycling_stats();
+----
+3	1	2	2

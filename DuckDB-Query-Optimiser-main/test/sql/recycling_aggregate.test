@@ -1,0 +1,110 @@
+# name: test/sql/recycling_aggregate.test
+# description: repeated aggregate is captured and replayed
+# group: [sql]
+
+require waddle
+
+# These tests observe pipeline breakers; whole query results are tested in recycling_query_result.test.
+statement ok
+SET GLOBAL waddle_recycling_query_results = false;
+
+statement ok
+SET threads = 6;
+
+statement ok
+CREATE TABLE recycling_numbers AS SELECT i % 3 AS group_id FROM range(12) t(i);
+
+query II rowsort
+SELECT group_id, count(*) FROM recycling_numbers GROUP BY group_id;
+----
+0	4
+1	4
+2	4
+
+query IIII
+SELECT lookups, hits, misses, captures FROM waddle_recycling_stats();
+----
+1	0	1	1
+
+query II rowsort
+SELECT group_id, count(*) FROM recycling_numbers GROUP BY group_id;
+----
+0	4
+1	4
+2	4
+
+query IIII
+SELECT lookups, hits, misses, captures FROM waddle_recycling_stats();
+----
+2	1	1	1
+
+# A plain EXPLAIN only plans the statement and must not publish a result.
+statement ok
+EXPLAIN SELECT group_id, sum(group_id) FROM recycling_numbers WHERE group_id < 2 GROUP BY group_id;
+
+query IIII
+SELECT lookups, hits, misses, captures FROM waddle_recycling_stats();
+----
+2	1	1	1
+
+# EXPLAIN ANALYZE executes the query, so it captures and then replays.
+statement ok
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT group_id, sum(group_id) FROM recycling_numbers WHERE group_id < 2 GROUP BY group_id;
+
+query IIII
+SELECT lookups, hits, misses, captures FROM waddle_recycling_stats();
+----
+3	1	2	2
+
+statement ok
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT group_id, sum(group_id) FROM recycling_numbers WHERE group_id < 2 GROUP BY group_id;
+
+query IIII
+SELECT lookups, hits, misses, captures FROM waddle_recycling_stats();
+----
+4	2	2	2
+
+statement ok
+SET waddle_recycling = false;
+
+query II rowsort
+SELECT group_id, count(*) FROM recycling_numbers GROUP BY group_id;
+----
+0	4
+1	4
+2	4
+
+query IIII
+SELECT lookups, hits, misses, captures FROM waddle_recycling_stats();
+----
+4	2	2	2
+
+statement ok
+SET waddle_recycling = true;
+
+query I rowsort
+SELECT group_id FROM recycling_numbers WHERE group_id = 1;
+----
+1
+1
+1
+1
+
+query IIII
+SELECT lookups, hits, misses, captures FROM waddle_recycling_stats();
+----
+4	2	2	2
+
+statement ok
+UPDATE recycling_numbers SET group_id = 2 WHERE group_id = 1;
+
+query II rowsort
+SELECT group_id, count(*) FROM recycling_numbers GROUP BY group_id;
+----
+0	4
+2	8
+
+query IIII
+SELECT lookups, hits, misses, captures FROM waddle_recycling_stats();
+----
+5	2	3	3

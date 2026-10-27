@@ -1,0 +1,123 @@
+# name: test/sql/recycling_verification.test
+# description: capture and replay survive DuckDB's query and plan verification
+# group: [sql]
+
+require waddle
+
+# These tests observe pipeline breakers; whole query results are tested in recycling_query_result.test.
+statement ok
+SET GLOBAL waddle_recycling_query_results = false;
+
+# Verification plans each statement several more ways (copied, deserialized, prepared, unoptimized ...),
+# executes every plan and compares the answers, and round-trips plans through serialization (which capture
+# and replay opt out of, see ADR-0003). Each extra execution also counts in the stats, so this file asserts
+# answers; the other recycling tests assert each hit exactly.
+statement ok
+PRAGMA enable_verification;
+
+statement ok
+CREATE TABLE recycling_verification_values AS SELECT i % 3 AS key, i AS value FROM range(12) t(i);
+
+statement ok
+CREATE TABLE recycling_verification_names AS SELECT i AS key, 'name' || i AS name FROM range(3) t(i);
+
+# A query without a pipeline breaker is not looked up.
+query I rowsort
+SELECT value FROM recycling_verification_values WHERE value > 9;
+----
+10
+11
+
+query I
+SELECT lookups FROM waddle_recycling_stats();
+----
+0
+
+# A plain EXPLAIN never captures.
+statement ok
+EXPLAIN SELECT key, count(*) FROM recycling_verification_values GROUP BY key;
+
+query II
+SELECT lookups, captures FROM waddle_recycling_stats();
+----
+0	0
+
+# With the master switch off, nothing is looked up.
+statement ok
+SET waddle_recycling = false;
+
+query II rowsort
+SELECT key, count(*) FROM recycling_verification_values GROUP BY key;
+----
+0	4
+1	4
+2	4
+
+query I
+SELECT lookups FROM waddle_recycling_stats();
+----
+0
+
+statement ok
+SET waddle_recycling = true;
+
+query II rowsort
+SELECT key, count(*) FROM recycling_verification_values GROUP BY key;
+----
+0	4
+1	4
+2	4
+
+query II rowsort
+SELECT key, count(*) FROM recycling_verification_values GROUP BY key;
+----
+0	4
+1	4
+2	4
+
+query I
+SELECT hits > 0 FROM waddle_recycling_stats();
+----
+true
+
+# Under a parent aggregate.
+query I
+SELECT sum(n) FROM (SELECT key, count(*) AS n FROM recycling_verification_values GROUP BY key);
+----
+12
+
+# An aggregate beneath a LIMIT is still captured completely.
+query I
+SELECT count(*) FROM (SELECT key, sum(value) AS total FROM recycling_verification_values GROUP BY key LIMIT 1);
+----
+1
+
+query II rowsort
+SELECT key, sum(value) FROM recycling_verification_values GROUP BY key;
+----
+0	18
+1	22
+2	26
+
+# A join inside the recyclable subtree, grouping strings.
+query II rowsort
+SELECT n.name, sum(v.value) FROM recycling_verification_values v JOIN recycling_verification_names n ON v.key = n.key
+GROUP BY n.name;
+----
+name0	18
+name1	22
+name2	26
+
+query II rowsort
+SELECT n.name, sum(v.value) FROM recycling_verification_values v JOIN recycling_verification_names n ON v.key = n.key
+GROUP BY n.name;
+----
+name0	18
+name1	22
+name2	26
+
+statement ok
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT key, max(value) FROM recycling_verification_values GROUP BY key;
+
+statement ok
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT key, max(value) FROM recycling_verification_values GROUP BY key;

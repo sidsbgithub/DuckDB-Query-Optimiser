@@ -1,0 +1,57 @@
+# name: test/sql/recycling_key_constants.test
+# description: recycling keys preserve constant values and types
+# group: [sql]
+
+require waddle
+
+# These tests observe pipeline breakers; whole query results are tested in recycling_query_result.test.
+statement ok
+SET GLOBAL waddle_recycling_query_results = false;
+
+statement ok
+CREATE TABLE recycling_constant_values AS SELECT i AS id FROM range(5) t(i);
+
+query I
+SELECT min('1') FROM recycling_constant_values;
+----
+1
+
+query I
+SELECT min(1) FROM recycling_constant_values;
+----
+1
+
+query IIII
+SELECT lookups, hits, misses, captures FROM waddle_recycling_stats();
+----
+2	0	2	2
+
+query I
+SELECT count(NULL) FROM recycling_constant_values;
+----
+0
+
+query I
+SELECT count(1) FROM recycling_constant_values;
+----
+5
+
+query IIII
+SELECT lookups, hits, misses, captures FROM waddle_recycling_stats();
+----
+4	0	4	4
+
+query I
+SELECT sum(CAST(id AS INTEGER)) FROM recycling_constant_values;
+----
+10
+
+query I
+SELECT sum(id) FROM recycling_constant_values;
+----
+10
+
+query IIII
+SELECT lookups, hits, misses, captures FROM waddle_recycling_stats();
+----
+6	0	6	6

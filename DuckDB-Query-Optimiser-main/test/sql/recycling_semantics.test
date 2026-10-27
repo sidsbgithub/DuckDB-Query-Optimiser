@@ -1,0 +1,131 @@
+# name: test/sql/recycling_semantics.test
+# description: NULLs, duplicates, empty inputs, decimals and casts match vanilla on capture and on hit
+# group: [sql]
+
+require waddle
+
+# These tests observe pipeline breakers; whole query results are tested in recycling_query_result.test.
+statement ok
+SET GLOBAL waddle_recycling_query_results = false;
+
+# Row 5 and 6 are exact duplicates; k, v, d, s and name each hold NULLs.
+statement ok
+CREATE TABLE recycling_semantics_values AS SELECT * FROM (VALUES
+    (1, 10, 1.50::DECIMAL(9,2), '7', 'a'),
+    (1, NULL, 2.25, '8', 'a'),
+    (NULL, 5, NULL, NULL, 'b'),
+    (NULL, NULL, 3.10, '9', NULL),
+    (2, 5, 1.50, '7', 'a'),
+    (2, 5, 1.50, '7', 'a'),
+    (3, 7, -0.75, '10', 'c')
+) t(k, v, d, s, name);
+
+statement ok
+CREATE TABLE recycling_semantics_empty AS SELECT * FROM recycling_semantics_values WHERE false;
+
+# Vanilla answers, each recorded under a label. With recycling on, every query executes twice more: first
+# through the capture, then through the replay, and both times it must return the labelled rows.
+statement ok
+SET waddle_recycling = false;
+
+query IIIIII rowsort nulls
+SELECT k, count(*), count(v), sum(v), min(v), max(name) FROM recycling_semantics_values GROUP BY k;
+----
+
+query IIII rowsort duplicates
+SELECT v, count(*), count(k), count(DISTINCT k) FROM recycling_semantics_values GROUP BY v;
+----
+
+query IIIIII rowsort duplicate_rows
+SELECT k, v, d, s, name, count(*) FROM recycling_semantics_values GROUP BY ALL;
+----
+
+query II rowsort empty_groups
+SELECT k, sum(v) FROM recycling_semantics_empty GROUP BY k;
+----
+
+query III nosort empty_total
+SELECT count(*), sum(v), max(name) FROM recycling_semantics_empty;
+----
+
+query II nosort empty_after_filter
+SELECT count(*), sum(v) FROM recycling_semantics_values WHERE v = k * 3;
+----
+
+query IIIII rowsort decimals
+SELECT name, sum(d), min(d), max(d), count(d) FROM recycling_semantics_values GROUP BY name;
+----
+
+query II rowsort decimal_groups
+SELECT d, sum(d::DECIMAL(38,10)) FROM recycling_semantics_values GROUP BY d;
+----
+
+query III rowsort casts
+SELECT CAST(v AS VARCHAR) AS text, sum(CAST(s AS INTEGER)), sum(TRY_CAST(name AS INTEGER)) FROM recycling_semantics_values GROUP BY text;
+----
+
+# Same input, different cast: the recycling keys differ, so neither may replay the other.
+query I nosort cast_one_digit
+SELECT sum(CAST(d AS DECIMAL(9,1))) FROM recycling_semantics_values;
+----
+
+query I nosort cast_two_digits
+SELECT sum(CAST(d AS DECIMAL(9,2))) FROM recycling_semantics_values;
+----
+
+statement ok
+SET waddle_recycling = true;
+
+loop i 0 2
+
+query IIIIII rowsort nulls
+SELECT k, count(*), count(v), sum(v), min(v), max(name) FROM recycling_semantics_values GROUP BY k;
+----
+
+query IIII rowsort duplicates
+SELECT v, count(*), count(k), count(DISTINCT k) FROM recycling_semantics_values GROUP BY v;
+----
+
+query IIIIII rowsort duplicate_rows
+SELECT k, v, d, s, name, count(*) FROM recycling_semantics_values GROUP BY ALL;
+----
+
+query II rowsort empty_groups
+SELECT k, sum(v) FROM recycling_semantics_empty GROUP BY k;
+----
+
+query III nosort empty_total
+SELECT count(*), sum(v), max(name) FROM recycling_semantics_empty;
+----
+
+query II nosort empty_after_filter
+SELECT count(*), sum(v) FROM recycling_semantics_values WHERE v = k * 3;
+----
+
+query IIIII rowsort decimals
+SELECT name, sum(d), min(d), max(d), count(d) FROM recycling_semantics_values GROUP BY name;
+----
+
+query II rowsort decimal_groups
+SELECT d, sum(d::DECIMAL(38,10)) FROM recycling_semantics_values GROUP BY d;
+----
+
+query III rowsort casts
+SELECT CAST(v AS VARCHAR) AS text, sum(CAST(s AS INTEGER)), sum(TRY_CAST(name AS INTEGER)) FROM recycling_semantics_values GROUP BY text;
+----
+
+query I nosort cast_one_digit
+SELECT sum(CAST(d AS DECIMAL(9,1))) FROM recycling_semantics_values;
+----
+
+query I nosort cast_two_digits
+SELECT sum(CAST(d AS DECIMAL(9,2))) FROM recycling_semantics_values;
+----
+
+endloop
+
+# 11 queries: each captured the first time and hit the second time, none skipped.
+query IIIII
+SELECT lookups, hits, misses, captures, skipped_unsupported FROM waddle_recycling_stats();
+----
+22	11	11	11	0

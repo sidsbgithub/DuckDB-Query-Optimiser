@@ -1,0 +1,53 @@
+# name: test/sql/recycling_key_bind_data.test
+# description: binder-consumed aggregate arguments never cause a false hit
+# group: [sql]
+
+require waddle
+
+# These tests observe pipeline breakers; whole query results are tested in recycling_query_result.test.
+statement ok
+SET GLOBAL waddle_recycling_query_results = false;
+
+statement ok
+SET threads = 1;
+
+statement ok
+CREATE TABLE recycling_bound_values AS
+SELECT i, CASE WHEN i = 0 THEN 'a' ELSE 'b' END AS s FROM range(2) t(i);
+
+query T
+SELECT string_agg(s, ',') FROM recycling_bound_values;
+----
+a,b
+
+query T
+SELECT string_agg(s, '|') FROM recycling_bound_values;
+----
+a|b
+
+query R
+SELECT quantile_cont(i, 0.25) FROM recycling_bound_values;
+----
+0.25
+
+query R
+SELECT quantile_cont(i, 0.75) FROM recycling_bound_values;
+----
+0.75
+
+# The key holds the serialized bind values, so each aggregate misses and is captured on its own.
+query IIII
+SELECT lookups, hits, misses, captures FROM waddle_recycling_stats();
+----
+4	0	4	4
+
+# The same bind values hit.
+query T
+SELECT string_agg(s, '|') FROM recycling_bound_values;
+----
+a|b
+
+query IIII
+SELECT lookups, hits, misses, captures FROM waddle_recycling_stats();
+----
+5	1	4	4

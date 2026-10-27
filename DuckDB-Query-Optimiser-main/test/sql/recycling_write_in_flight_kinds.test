@@ -1,0 +1,225 @@
+# name: test/sql/recycling_write_in_flight_kinds.test
+# description: schema changes, attaches and prepared writes are in flight until they commit or roll back, like DML
+# group: [sql]
+
+require waddle
+
+# These tests observe pipeline breakers; whole query results are tested in recycling_query_result.test.
+statement ok
+SET GLOBAL waddle_recycling_query_results = false;
+
+statement ok
+CREATE TABLE recycling_kinds_values AS SELECT i AS value FROM range(1000) t(i);
+
+query I con2
+SELECT sum(value) FROM recycling_kinds_values;
+----
+499500
+
+query I con2
+SELECT sum(value) FROM recycling_kinds_values;
+----
+499500
+
+query I con2
+SELECT hits FROM waddle_recycling_stats();
+----
+1
+
+# CREATE TABLE: nothing replays while it is open, and its commit invalidates.
+statement ok con1
+BEGIN TRANSACTION;
+
+statement ok con1
+CREATE TABLE recycling_kinds_other (x INTEGER);
+
+query I con2
+SELECT sum(value) FROM recycling_kinds_values;
+----
+499500
+
+query II con2
+SELECT hits, invalidations FROM waddle_recycling_stats();
+----
+1	1
+
+statement ok con1
+COMMIT;
+
+query II con2
+SELECT hits, invalidations FROM waddle_recycling_stats();
+----
+1	2
+
+query I con2
+SELECT sum(value) FROM recycling_kinds_values;
+----
+499500
+
+query I con2
+SELECT sum(value) FROM recycling_kinds_values;
+----
+499500
+
+query I con2
+SELECT hits FROM waddle_recycling_stats();
+----
+2
+
+# ALTER TABLE on a recycled table, rolled back: nothing replays while it is open, and the rollback keeps the cache.
+statement ok con1
+BEGIN TRANSACTION;
+
+statement ok con1
+ALTER TABLE recycling_kinds_values ADD COLUMN extra INTEGER DEFAULT 0;
+
+query I con2
+SELECT sum(value) FROM recycling_kinds_values;
+----
+499500
+
+query I con2
+SELECT hits FROM waddle_recycling_stats();
+----
+2
+
+statement ok con1
+ROLLBACK;
+
+query I con2
+SELECT sum(value) FROM recycling_kinds_values;
+----
+499500
+
+query II con2
+SELECT hits, invalidations FROM waddle_recycling_stats();
+----
+3	2
+
+# DROP TABLE: in flight until it commits, and its commit invalidates.
+statement ok con1
+BEGIN TRANSACTION;
+
+statement ok con1
+DROP TABLE recycling_kinds_other;
+
+query I con2
+SELECT sum(value) FROM recycling_kinds_values;
+----
+499500
+
+query I con2
+SELECT hits FROM waddle_recycling_stats();
+----
+3
+
+statement ok con1
+COMMIT;
+
+query II con2
+SELECT hits, invalidations FROM waddle_recycling_stats();
+----
+3	3
+
+query I con2
+SELECT sum(value) FROM recycling_kinds_values;
+----
+499500
+
+# A prepared write blocks nothing until it executes: preparing it only plans it.
+statement ok con1
+PREPARE recycling_kinds_add AS INSERT INTO recycling_kinds_values VALUES ($1);
+
+query I con2
+SELECT sum(value) FROM recycling_kinds_values;
+----
+499500
+
+query I con2
+SELECT hits FROM waddle_recycling_stats();
+----
+4
+
+statement ok con1
+BEGIN TRANSACTION;
+
+statement ok con1
+EXECUTE recycling_kinds_add(1000);
+
+query I con2
+SELECT sum(value) FROM recycling_kinds_values;
+----
+499500
+
+query I con2
+SELECT hits FROM waddle_recycling_stats();
+----
+4
+
+statement ok con1
+COMMIT;
+
+query I con2
+SELECT sum(value) FROM recycling_kinds_values;
+----
+500500
+
+query II con2
+SELECT hits, invalidations FROM waddle_recycling_stats();
+----
+4	4
+
+# ATTACH and DETACH change which tables exist without modifying a database: each is in flight until it commits, and
+# its commit invalidates.
+statement ok con1
+BEGIN TRANSACTION;
+
+statement ok con1
+ATTACH ':memory:' AS recycling_kinds_scratch;
+
+query I con2
+SELECT sum(value) FROM recycling_kinds_values;
+----
+500500
+
+query I con2
+SELECT hits FROM waddle_recycling_stats();
+----
+4
+
+statement ok con1
+COMMIT;
+
+query II con2
+SELECT hits, invalidations FROM waddle_recycling_stats();
+----
+4	5
+
+query I con2
+SELECT sum(value) FROM recycling_kinds_values;
+----
+500500
+
+statement ok con1
+BEGIN TRANSACTION;
+
+statement ok con1
+DETACH recycling_kinds_scratch;
+
+query I con2
+SELECT sum(value) FROM recycling_kinds_values;
+----
+500500
+
+query I con2
+SELECT hits FROM waddle_recycling_stats();
+----
+4
+
+statement ok con1
+COMMIT;
+
+query II con2
+SELECT hits, invalidations FROM waddle_recycling_stats();
+----
+4	6

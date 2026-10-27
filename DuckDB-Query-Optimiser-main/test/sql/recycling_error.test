@@ -1,0 +1,85 @@
+# name: test/sql/recycling_error.test
+# description: an error inside a recyclable subtree publishes nothing
+# group: [sql]
+
+require waddle
+
+# These tests observe pipeline breakers; whole query results are tested in recycling_query_result.test.
+statement ok
+SET GLOBAL waddle_recycling_query_results = false;
+
+statement ok
+SET threads = 6;
+
+# One group of 20000 holds +1e308 and -1e308, so its STDDEV_POP overflows. The aggregate raises the error while
+# finalizing groups, which already stream into the capture: groups finalized earlier reach it before the error,
+# so a capture that published what it had received would be caught below.
+statement ok
+CREATE TABLE recycling_error_values AS
+SELECT i % 20000 AS key,
+       CASE WHEN i % 20000 = 19999 THEN (CASE WHEN (i // 20000) % 2 = 0 THEN 1e308 ELSE -1e308 END)
+            ELSE i::DOUBLE END AS value
+FROM range(200000) t(i);
+
+statement error
+SELECT key, stddev_pop(value) FROM recycling_error_values GROUP BY key;
+----
+STDDEV_POP is out of range!
+
+query IIIII
+SELECT lookups, hits, misses, captures, current_bytes FROM waddle_recycling_stats();
+----
+1	0	1	0	0
+
+# Nothing was published: the identical query misses, executes the original plan and gets the vanilla answer.
+statement error
+SELECT key, stddev_pop(value) FROM recycling_error_values GROUP BY key;
+----
+STDDEV_POP is out of range!
+
+query IIIII
+SELECT lookups, hits, misses, captures, current_bytes FROM waddle_recycling_stats();
+----
+2	0	2	0	0
+
+# The failed captures leave the cache working: a query without the overflowing group captures, then hits.
+query I
+SELECT count(s) FROM (SELECT key, stddev_pop(value) AS s FROM recycling_error_values WHERE key < 19999 GROUP BY key);
+----
+19999
+
+query I
+SELECT count(s) FROM (SELECT key, stddev_pop(value) AS s FROM recycling_error_values WHERE key < 19999 GROUP BY key);
+----
+19999
+
+query IIII
+SELECT lookups, hits, misses, captures FROM waddle_recycling_stats();
+----
+5	1	4	2
+
+# The error is raised above a nested capture whose own subtree completed: that recycled result is complete and
+# published, and a different parent replays it with the vanilla answer.
+statement ok
+CREATE TABLE recycling_error_extremes AS
+SELECT i AS key, CASE WHEN i = 0 THEN 1e308 ELSE -1e308 END AS value FROM range(2) t(i);
+
+statement error
+SELECT stddev_pop(m) FROM (SELECT key, max(value) AS m FROM recycling_error_extremes GROUP BY key);
+----
+STDDEV_POP is out of range!
+
+query IIII
+SELECT lookups, hits, misses, captures FROM waddle_recycling_stats();
+----
+7	1	6	3
+
+query I
+SELECT count(m) FROM (SELECT key, max(value) AS m FROM recycling_error_extremes GROUP BY key);
+----
+2
+
+query IIII
+SELECT lookups, hits, misses, captures FROM waddle_recycling_stats();
+----
+9	2	7	4

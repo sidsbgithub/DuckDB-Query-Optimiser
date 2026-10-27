@@ -1,0 +1,231 @@
+# name: test/sql/recycling_distinct.test
+# description: a repeated DISTINCT set is captured and replayed; DISTINCT never matches its non-DISTINCT input
+# group: [sql]
+
+require waddle
+
+# These tests observe pipeline breakers; whole query results are tested in recycling_query_result.test.
+statement ok
+SET GLOBAL waddle_recycling_query_results = false;
+
+statement ok
+SET threads = 6;
+
+# Credits repeat movies, so a DISTINCT set of movie ids is smaller than its input.
+statement ok
+CREATE TABLE recycling_distinct_credits AS
+SELECT i % 7 AS movie_id, CASE WHEN i % 7 < 4 THEN 'US' ELSE 'FR' END AS country, i AS person_id
+FROM range(28) t(i);
+
+# The "US movies" set, shared by two queries with different outer computations.
+query I
+SELECT count(*) FROM (SELECT DISTINCT movie_id FROM recycling_distinct_credits WHERE country = 'US') us_movies;
+----
+4
+
+query IIII
+SELECT lookups, hits, misses, captures FROM waddle_recycling_stats();
+----
+2	0	2	2
+
+query I
+SELECT sum(movie_id) FROM (SELECT DISTINCT movie_id FROM recycling_distinct_credits WHERE country = 'US') us_movies;
+----
+6
+
+query IIII
+SELECT lookups, hits, misses, captures FROM waddle_recycling_stats();
+----
+4	1	3	3
+
+# The same set joined back to the credits, written with different aliases and whitespace.
+query II
+SELECT count(*), sum(c.person_id)
+FROM recycling_distinct_credits c
+JOIN (select distinct x.movie_id from recycling_distinct_credits x where x.country='US') m ON c.movie_id = m.movie_id;
+----
+16	192
+
+query IIII
+SELECT lookups, hits, misses, captures FROM waddle_recycling_stats();
+----
+7	2	5	5
+
+# A top-level DISTINCT is a root too: captured once, replayed on repeat.
+query I rowsort
+SELECT DISTINCT country FROM recycling_distinct_credits;
+----
+FR
+US
+
+query I rowsort
+SELECT DISTINCT country FROM recycling_distinct_credits;
+----
+FR
+US
+
+query IIII
+SELECT lookups, hits, misses, captures FROM waddle_recycling_stats();
+----
+9	3	6	6
+
+# The non-DISTINCT input of the US set: its aggregate is its own recyclable subtree and misses.
+query I
+SELECT count(*) FROM (SELECT movie_id FROM recycling_distinct_credits WHERE country = 'US') us_credits;
+----
+16
+
+query I
+SELECT sum(movie_id) FROM (SELECT movie_id FROM recycling_distinct_credits WHERE country = 'US') us_credits;
+----
+24
+
+query IIII
+SELECT lookups, hits, misses, captures FROM waddle_recycling_stats();
+----
+11	3	8	8
+
+# Both repeats hit at their outer aggregate, which contains the DISTINCT set or its input:
+# neither result is served for the other.
+query I
+SELECT count(*) FROM (SELECT DISTINCT movie_id FROM recycling_distinct_credits WHERE country = 'US') us_movies;
+----
+4
+
+query I
+SELECT count(*) FROM (SELECT movie_id FROM recycling_distinct_credits WHERE country = 'US') us_credits;
+----
+16
+
+query IIII
+SELECT lookups, hits, misses, captures FROM waddle_recycling_stats();
+----
+13	5	8	8
+
+# GROUP BY without aggregates computes the same set as DISTINCT, but is a different operator: it misses.
+query I
+SELECT count(*) FROM (SELECT movie_id FROM recycling_distinct_credits WHERE country = 'US' GROUP BY movie_id) g;
+----
+4
+
+query IIII
+SELECT lookups, hits, misses, captures FROM waddle_recycling_stats();
+----
+15	5	10	10
+
+# DISTINCT ON keeps one row per target chosen by ORDER BY: order-sensitive, so it is skipped.
+query II
+SELECT DISTINCT ON (movie_id) movie_id, person_id FROM recycling_distinct_credits ORDER BY movie_id, person_id DESC LIMIT 2;
+----
+0	21
+1	22
+
+query II
+SELECT lookups, skipped_unsupported FROM waddle_recycling_stats();
+----
+15	1
+
+# UNION removes duplicates over a set operation, which the recycling key does not describe.
+query I
+SELECT count(*) FROM (SELECT movie_id FROM recycling_distinct_credits UNION SELECT person_id FROM recycling_distinct_credits) u;
+----
+28
+
+query II
+SELECT lookups, skipped_unsupported FROM waddle_recycling_stats();
+----
+15	2
+
+# NULLs and duplicate NULLs collapse to one row, on capture and on replay.
+statement ok
+CREATE TABLE recycling_distinct_nulls AS SELECT CASE WHEN i % 3 = 0 THEN NULL ELSE i % 2 END AS v FROM range(9) t(i);
+
+query I rowsort
+SELECT DISTINCT v FROM recycling_distinct_nulls;
+----
+0
+1
+NULL
+
+query I rowsort
+SELECT DISTINCT v FROM recycling_distinct_nulls;
+----
+0
+1
+NULL
+
+query II
+SELECT hits, misses FROM waddle_recycling_stats();
+----
+6	11
+
+# Master switch off: the same answers, no recycling events.
+statement ok
+SET waddle_recycling = false;
+
+query I
+SELECT count(*) FROM (SELECT DISTINCT movie_id FROM recycling_distinct_credits WHERE country = 'US') us_movies;
+----
+4
+
+query I rowsort
+SELECT DISTINCT v FROM recycling_distinct_nulls;
+----
+0
+1
+NULL
+
+query II
+SELECT hits, misses FROM waddle_recycling_stats();
+----
+6	11
+
+statement ok
+SET waddle_recycling = true;
+
+# An empty DISTINCT set is a recycled result too. (A value outside the column's range would be optimized away.)
+query I
+SELECT DISTINCT movie_id FROM recycling_distinct_credits WHERE country = 'GB';
+----
+
+query I
+SELECT DISTINCT movie_id FROM recycling_distinct_credits WHERE country = 'GB';
+----
+
+query II
+SELECT hits, misses FROM waddle_recycling_stats();
+----
+7	12
+
+# EXPLAIN ANALYZE executes the query, so it captures and then replays.
+statement ok
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(*) FROM (SELECT DISTINCT person_id FROM recycling_distinct_credits) p;
+
+statement ok
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(*) FROM (SELECT DISTINCT person_id FROM recycling_distinct_credits) p;
+
+query II
+SELECT hits, misses FROM waddle_recycling_stats();
+----
+8	14
+
+# Captured with 6 threads, replayed with 1: the same answers.
+statement ok
+SET threads = 1;
+
+query I
+SELECT count(*) FROM (SELECT DISTINCT person_id FROM recycling_distinct_credits) p;
+----
+28
+
+query I rowsort
+SELECT DISTINCT v FROM recycling_distinct_nulls;
+----
+0
+1
+NULL
+
+query II
+SELECT hits, misses FROM waddle_recycling_stats();
+----
+10	14

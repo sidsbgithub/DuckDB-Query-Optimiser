@@ -1,0 +1,32 @@
+# name: test/sql/recycling_external_catalog.test
+# description: tables in an attached non-DuckDB catalog change without a DuckDB commit, so their scans are skipped
+# group: [sql]
+
+require waddle
+
+# These tests observe pipeline breakers; whole query results are tested in recycling_query_result.test.
+statement ok
+SET GLOBAL waddle_recycling_query_results = false;
+
+require sqlite_scanner
+
+statement ok
+ATTACH '__TEST_DIR__/recycling_external_catalog.db' AS recycling_external (TYPE sqlite);
+
+statement ok
+CREATE TABLE recycling_external.external_values AS SELECT i AS value FROM range(1000) t(i);
+
+query I
+SELECT sum(value) FROM recycling_external.external_values;
+----
+499500
+
+query I
+SELECT sum(value) FROM recycling_external.external_values;
+----
+499500
+
+query III
+SELECT lookups, captures, skipped_external_scan > 0 FROM waddle_recycling_stats();
+----
+0	0	true

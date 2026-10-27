@@ -1,0 +1,81 @@
+# name: test/sql/recycling_diagnostics.test
+# description: waddle_recycling_diagnostics logs recycling keys, hits, misses and skip reasons
+# group: [sql]
+
+require waddle
+
+# These tests observe pipeline breakers; whole query results are tested in recycling_query_result.test.
+statement ok
+SET GLOBAL waddle_recycling_query_results = false;
+
+statement ok
+CALL enable_logging('WaddleRecycling');
+
+statement ok
+CREATE TABLE recycling_diagnostics_values AS SELECT i % 3 AS key FROM range(12) t(i);
+
+# Diagnostics are off by default.
+query I
+SELECT sum(key) FROM recycling_diagnostics_values;
+----
+12
+
+query I
+SELECT count(*) FROM duckdb_logs WHERE type = 'WaddleRecycling';
+----
+0
+
+statement ok
+SET waddle_recycling_diagnostics = true;
+
+query II rowsort
+SELECT key, count(*) FROM recycling_diagnostics_values GROUP BY key;
+----
+0	4
+1	4
+2	4
+
+query II rowsort
+SELECT key, count(*) FROM recycling_diagnostics_values GROUP BY key;
+----
+0	4
+1	4
+2	4
+
+query I
+SELECT count(*) FROM recycling_diagnostics_values WHERE random() >= 0;
+----
+12
+
+query I rowsort
+SELECT regexp_extract(message, '^(hit|miss|skip reason=[a-z_]+) ', 1) FROM duckdb_logs WHERE type = 'WaddleRecycling';
+----
+hit
+miss
+skip reason=volatile
+
+# The miss and the later hit log the same recycling key.
+query II
+SELECT count(*), count(DISTINCT regexp_extract(message, 'key=(.*)$', 1))
+FROM duckdb_logs WHERE type = 'WaddleRecycling' AND message LIKE '% key=%';
+----
+2	1
+
+# Every event names the kind of pipeline breaker that roots the subtree. The count over the DISTINCT set misses
+# at both. The queries over duckdb_logs above also encounter ineligible join build sides and an aggregate.
+query I
+SELECT count(*) FROM (SELECT DISTINCT key FROM recycling_diagnostics_values);
+----
+3
+
+query II rowsort
+SELECT regexp_extract(message, '^(hit|miss|skip)', 1), regexp_extract(message, ' breaker=([a-z_]+) ', 1)
+FROM duckdb_logs WHERE type = 'WaddleRecycling';
+----
+hit	aggregate
+miss	aggregate
+miss	aggregate
+miss	distinct
+skip	aggregate
+skip	join_build_side
+skip	join_build_side
